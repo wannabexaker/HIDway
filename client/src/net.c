@@ -10,12 +10,20 @@
 
 static SOCKET sock = INVALID_SOCKET;
 static LARGE_INTEGER perf_freq;
+static int wsa_started;
 
 int hidway_net_open(const char *host, int port)
 {
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-        return -1;
+    if (!wsa_started) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+            return -1;
+        wsa_started = 1;
+    }
+    if (sock != INVALID_SOCKET) { /* reconnecting (e.g. after a settings change) */
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
 
     QueryPerformanceFrequency(&perf_freq);
 
@@ -55,7 +63,7 @@ void hidway_net_close(void)
         closesocket(sock);
         sock = INVALID_SOCKET;
     }
-    WSACleanup();
+    /* WSACleanup is left to process exit so the socket can be reopened. */
 }
 
 int hidway_net_send(const uint8_t *buf, size_t len)

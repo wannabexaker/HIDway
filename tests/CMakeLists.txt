@@ -3,6 +3,9 @@ add_executable(hidway_tests
     ${HIDWAY_COMMON}/hidway_kbd.c
     ${HIDWAY_COMMON}/hidway_motion.c
     ${HIDWAY_COMMON}/keymap_sc2hid.c
+    ${HIDWAY_COMMON}/crc16.c
+    ${HIDWAY_COMMON}/cobs.c
+    ${HIDWAY_COMMON}/serial.c
 )
 
 target_include_directories(hidway_tests PRIVATE ${HIDWAY_COMMON})

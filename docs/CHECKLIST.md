@@ -18,6 +18,13 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   link-timeout release fired, RTT p50 ~94 ms over the DERP (relayed) path.
 - [x] **6. Public repo hygiene** — scrubbed of personal data, placeholders
   only, README/SECURITY/LICENSE/ROADMAP, noreply commit identity.
+- [x] **10/11. Serial link code, both ends** — `common/` COBS+CRC16 framing
+  (host unit-tested); `hidwayd` serial output + release-on-timeout (`--serial`,
+  builds on the Pi); Pico `link.c` UART receiver with catch-up and
+  link-timeout release (firmware builds). *Not yet tested on real hardware.*
+- [x] **12. Client UI** — health header (RTT/loss/pps/relay-serial/armed-since),
+  recent-input history (memory only), in-app settings + save to hidway.ini,
+  panic hotkey + auto-disarm-on-link-loss, always starts disarmed.
 
 ## Blocked on hardware / decision
 
@@ -34,12 +41,9 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 
 ## Todo
 
-- [ ] **10. Pico UART receiver + HID output wired to the link** (replaces the
-  T0 input source).
-- [ ] **11. `hidwayd` serial output + release-on-timeout** (stubs are marked in
-  `relay/hidwayd.c`).
-- [ ] **12. Status/RTT in the client UI over the real path** (loss, RTT, relay
-  counters) — plumbing exists; surface it.
+- [!] **8b. On-hardware serial test** — flash the link firmware
+  (`-DHIDWAY_T0=OFF`), run `hidwayd --serial /dev/serial/by-id/...`, confirm the
+  target receives input end to end. Needs the Debug Probe + Pico.
 - [ ] **13. Local input handling for gaming** — so input goes to the target
   only. (Design-sensitive; revisit carefully.)
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,

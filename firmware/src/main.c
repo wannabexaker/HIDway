@@ -9,6 +9,8 @@
 
 #if HIDWAY_T0
 #include "t0.h"
+#else
+#include "link.h"
 #endif
 
 #define HIDWAY_WATCHDOG_MS 100
@@ -22,6 +24,9 @@ static led_mode_t led_mode(void)
 #if HIDWAY_T0
     if (t0_active())
         return LED_BLINK_FAST;
+#else
+    if (link_active())
+        return LED_BLINK_FAST;
 #endif
     return LED_ON;
 }
@@ -34,6 +39,8 @@ int main(void)
 
 #if HIDWAY_T0
     t0_init();
+#else
+    link_init();
 #endif
 
     /* A hang resets the chip; the host then sees the device disappear,
@@ -44,6 +51,8 @@ int main(void)
         tud_task();
 #if HIDWAY_T0
         t0_task();
+#else
+        link_task();
 #endif
         hid_out_task();
         led_task(led_mode());

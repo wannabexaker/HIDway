@@ -1,8 +1,23 @@
 # HIDway client configuration.
 # Copy to hidway.ini next to hidway-client.exe and edit.
 
-# Tailscale IP (or MagicDNS name) of the Raspberry Pi 4 running hidwayd.
+# Tailscale IP (or MagicDNS name) of the Raspberry Pi running hidwayd.
 target = 100.100.100.100
-
-# UDP port hidwayd listens on.
 port = 47800
+
+# State send rate while ARMED (10..1000 Hz).
+send_rate_hz = 250
+
+# Auto-disarm if the relay goes silent for this long while armed (0 = off).
+auto_disarm_ms = 3000
+
+# Relay keyboard / mouse input (1 = on, 0 = off).
+relay_keyboard = 1
+relay_mouse = 1
+
+# Record recent-input history in the UI (memory only, never written to disk).
+history_enabled = 1
+
+# Hotkeys: modifiers + one key, e.g. ctrl+shift+f12, ctrl+alt+shift+end.
+toggle_hotkey = ctrl+shift+f12
+panic_hotkey = ctrl+alt+shift+end

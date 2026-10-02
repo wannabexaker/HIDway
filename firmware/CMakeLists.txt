@@ -26,11 +26,17 @@ add_executable(hidway_fw
     src/bootsel.c
     src/led.c
     src/t0.c
+    src/link.c
     ${HIDWAY_COMMON}/hidway_kbd.c
     ${HIDWAY_COMMON}/hidway_motion.c
+    ${HIDWAY_COMMON}/serial.c
+    ${HIDWAY_COMMON}/cobs.c
+    ${HIDWAY_COMMON}/crc16.c
 )
 
 target_include_directories(hidway_fw PRIVATE src ${HIDWAY_COMMON})
+
+target_link_libraries(hidway_fw PRIVATE hardware_uart)
 
 target_compile_definitions(hidway_fw PRIVATE
     HIDWAY_USB_VID=${HIDWAY_USB_VID}

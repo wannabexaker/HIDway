@@ -13,9 +13,10 @@
  * Principles: accept only from the allowed peer; never queue (keep the latest
  * state only); treat loss of the client as "release everything".
  */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE /* cfmakeraw, CRTSCTS, getopt_long, clock_gettime */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
@@ -25,10 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "protocol.h"
+#include "serial.h"
 
 #define LINK_TIMEOUT_MS 250
 #define STATS_PERIOD_MS 1000
@@ -41,6 +44,85 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static speed_t baud_const(int baud)
+{
+    switch (baud) {
+    case 115200: return B115200;
+    case 230400: return B230400;
+    case 460800: return B460800;
+    case 921600: return B921600;
+    case 1000000: return B1000000;
+    default: return 0;
+    }
+}
+
+static int serial_open(const char *dev, int baud)
+{
+    speed_t sp = baud_const(baud);
+    if (!sp) {
+        fprintf(stderr, "unsupported baud: %d\n", baud);
+        return -1;
+    }
+    int fd = open(dev, O_WRONLY | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open serial");
+        return -1;
+    }
+    struct termios t;
+    if (tcgetattr(fd, &t) == 0) {
+        cfmakeraw(&t);
+        cfsetospeed(&t, sp);
+        cfsetispeed(&t, sp);
+        t.c_cflag |= CLOCAL | CREAD;
+        t.c_cflag &= (tcflag_t)~CRTSCTS;
+        tcsetattr(fd, TCSANOW, &t);
+    }
+    return fd;
+}
+
+/* Write one complete frame. Serial is fast (one frame ~0.5 ms at 921600) and
+ * we write at most at the incoming rate, so this never backs up into a queue. */
+static void serial_write_frame(int fd, const hidway_serial_state_t *s)
+{
+    if (fd < 0)
+        return;
+    uint8_t f[HIDWAY_SER_FRAME_MAX];
+    size_t n = hidway_serial_build(s, f, sizeof f);
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, f + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            break; /* drop; the next frame carries full state again */
+        }
+        off += (size_t)w;
+    }
+}
+
+static void serial_send_state(int fd, const hidway_input_pkt_t *p)
+{
+    hidway_serial_state_t s;
+    s.type = HIDWAY_SER_STATE;
+    s.seq = (uint16_t)p->seq;
+    s.mods = p->mods;
+    memcpy(s.keys, p->keys, HIDWAY_KEY_BITMAP_BYTES);
+    s.buttons = p->buttons;
+    s.x = p->x;
+    s.y = p->y;
+    s.wheel = p->wheel;
+    s.pan = p->pan;
+    serial_write_frame(fd, &s);
+}
+
+static void serial_send_release(int fd, uint16_t seq)
+{
+    hidway_serial_state_t s = {0};
+    s.type = HIDWAY_SER_RELEASE;
+    s.seq = seq;
+    serial_write_frame(fd, &s);
 }
 
 static int popcount_bitmap(const uint8_t *bm, size_t n)
@@ -56,6 +138,8 @@ int main(int argc, char **argv)
 {
     const char *bind_addr = "0.0.0.0";
     const char *allow_addr = NULL; /* if set, only accept this source IP */
+    const char *serial_dev = NULL; /* if set, forward to the Pico here */
+    int baud = 921600;
     int port = 47800;
     int quiet = 0;
 
@@ -63,18 +147,23 @@ int main(int argc, char **argv)
         {"bind", required_argument, 0, 'b'},
         {"allow", required_argument, 0, 'a'},
         {"port", required_argument, 0, 'p'},
+        {"serial", required_argument, 0, 's'},
+        {"baud", required_argument, 0, 'B'},
         {"quiet", no_argument, 0, 'q'},
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "b:a:p:q", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "b:a:p:s:B:q", opts, NULL)) != -1) {
         switch (c) {
         case 'b': bind_addr = optarg; break;
         case 'a': allow_addr = optarg; break;
         case 'p': port = atoi(optarg); break;
+        case 's': serial_dev = optarg; break;
+        case 'B': baud = atoi(optarg); break;
         case 'q': quiet = 1; break;
         default:
-            fprintf(stderr, "usage: %s [--bind IP] [--allow IP] [--port N] [--quiet]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--bind IP] [--allow IP] [--port N]"
+                            " [--serial DEV] [--baud N] [--quiet]\n", argv[0]);
             return 2;
         }
     }
@@ -102,8 +191,16 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    fprintf(stderr, "hidwayd: listening on %s:%d%s%s (no serial yet - dump/echo mode)\n",
-            bind_addr, port, allow_addr ? ", allow=" : "", allow_addr ? allow_addr : "");
+    int serial_fd = -1;
+    if (serial_dev) {
+        serial_fd = serial_open(serial_dev, baud);
+        if (serial_fd < 0)
+            fprintf(stderr, "hidwayd: continuing without serial (dump/echo only)\n");
+    }
+
+    fprintf(stderr, "hidwayd: listening on %s:%d%s%s | serial: %s\n",
+            bind_addr, port, allow_addr ? ", allow=" : "", allow_addr ? allow_addr : "",
+            serial_fd >= 0 ? serial_dev : "none (dump/echo mode)");
 
     /* Per-session accounting. */
     uint32_t session = 0;
@@ -155,8 +252,8 @@ int main(int argc, char **argv)
                     link_up = true;
                     last_pkt_ms = t;
 
-                    /* >>> serial output goes here: encode `latest` as a UART
-                     *     frame and write the newest one (drop any queued). */
+                    /* Forward the latest full state to the Pico. */
+                    serial_send_state(serial_fd, &latest);
 
                     /* Echo status back for RTT/loss measurement. */
                     hidway_status_pkt_t st = {0};
@@ -165,7 +262,7 @@ int main(int argc, char **argv)
                     st.client_time_us = p.client_time_us;
                     st.frames_ok = frames_ok;
                     st.seq_gaps = seq_gaps;
-                    st.flags = 0;
+                    st.flags = (serial_fd >= 0) ? 0x0002 : 0; /* bit1: relay serial open */
                     st.leds = 0;
                     uint8_t sb[HIDWAY_STATUS_PKT_LEN];
                     size_t sl = hidway_status_encode(sb, &st);
@@ -178,7 +275,7 @@ int main(int argc, char **argv)
         if (link_up && t - last_pkt_ms > LINK_TIMEOUT_MS) {
             link_up = false;
             fprintf(stderr, "hidwayd: LINK TIMEOUT -> release all\n");
-            /* >>> serial release goes here: send a RELEASE frame to the Pico. */
+            serial_send_release(serial_fd, (uint16_t)(last_seq + 1));
         }
 
         if (t >= next_stats_ms) {
@@ -196,6 +293,10 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "hidwayd: shutting down\n");
+    if (serial_fd >= 0) {
+        serial_send_release(serial_fd, (uint16_t)(last_seq + 1));
+        close(serial_fd);
+    }
     close(fd);
     return 0;
 }

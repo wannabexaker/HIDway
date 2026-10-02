@@ -2,10 +2,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cobs.h"
+#include "crc16.h"
 #include "hidway_kbd.h"
 #include "hidway_motion.h"
 #include "keymap_sc2hid.h"
 #include "protocol.h"
+#include "serial.h"
 
 static int failures;
 
@@ -295,12 +298,123 @@ static void test_protocol_status(void)
     CHECK(!hidway_status_decode(buf, 4, &out));
 }
 
+static void test_crc16(void)
+{
+    /* CRC-16/CCITT-FALSE test vector: "123456789" -> 0x29B1. */
+    const uint8_t v[] = {'1','2','3','4','5','6','7','8','9'};
+    CHECK(hidway_crc16(v, sizeof v) == 0x29B1);
+    CHECK(hidway_crc16((const uint8_t *)"", 0) == 0xFFFF);
+}
+
+static void cobs_roundtrip(const uint8_t *in, size_t len)
+{
+    uint8_t enc[1024], dec[1024];
+    size_t e = hidway_cobs_encode(in, len, enc);
+    for (size_t i = 0; i < e; i++)
+        CHECK(enc[i] != 0x00); /* encoded data must be zero-free */
+    size_t d = hidway_cobs_decode(enc, e, dec);
+    CHECK(d == len);
+    CHECK(memcmp(dec, in, len) == 0);
+}
+
+static void test_cobs(void)
+{
+    uint8_t a[] = {1, 2, 3};
+    uint8_t b[] = {0, 0, 0};
+    uint8_t c[] = {1, 0, 2, 0, 0, 3};
+    cobs_roundtrip(a, sizeof a);
+    cobs_roundtrip(b, sizeof b);
+    cobs_roundtrip(c, sizeof c);
+
+    /* Long run with no zeros (forces the 0xFF code split at 254). */
+    uint8_t big[600];
+    for (size_t i = 0; i < sizeof big; i++)
+        big[i] = (uint8_t)(i % 7 == 0 ? 0 : (i & 0xFF) | 1);
+    cobs_roundtrip(big, sizeof big);
+
+    uint8_t allnz[300];
+    for (size_t i = 0; i < sizeof allnz; i++)
+        allnz[i] = (uint8_t)((i & 0xFE) | 1);
+    cobs_roundtrip(allnz, sizeof allnz);
+
+    /* A 0x00 inside encoded data is malformed. */
+    uint8_t bad[] = {2, 5, 0, 3};
+    uint8_t out[16];
+    CHECK(hidway_cobs_decode(bad, sizeof bad, out) == 0);
+}
+
+static void test_serial(void)
+{
+    CHECK(HIDWAY_SER_PAYLOAD_LEN == 40);
+
+    hidway_serial_state_t s = {0}, got = {0};
+    s.type = HIDWAY_SER_STATE;
+    s.seq = 0xBEEF;
+    s.mods = 0x11;
+    hidway_bitmap_set(s.keys, 0x1A);
+    hidway_bitmap_set(s.keys, 0x04);
+    s.buttons = 0x0A;
+    s.x = -123456;
+    s.y = 99999;
+    s.wheel = -5;
+    s.pan = 3;
+
+    uint8_t frame[HIDWAY_SER_FRAME_MAX];
+    size_t n = hidway_serial_build(&s, frame, sizeof frame);
+    CHECK(n > 0);
+    CHECK(frame[n - 1] == 0x00); /* delimiter */
+
+    hidway_deframer_t d;
+    hidway_deframer_reset(&d);
+    bool done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done);
+    CHECK(got.type == s.type && got.seq == s.seq && got.mods == s.mods);
+    CHECK(memcmp(got.keys, s.keys, HIDWAY_KEY_BITMAP_BYTES) == 0);
+    CHECK(got.buttons == s.buttons);
+    CHECK(got.x == s.x && got.y == s.y && got.wheel == s.wheel && got.pan == s.pan);
+
+    /* Corruption: flip a byte in the middle -> CRC rejects the frame. */
+    hidway_deframer_reset(&d);
+    frame[3] ^= 0xFF;
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(!done);
+    frame[3] ^= 0xFF;
+
+    /* Leading noise before the first delimiter is skipped cleanly. */
+    hidway_deframer_reset(&d);
+    hidway_deframer_push(&d, 0x11, &got);
+    hidway_deframer_push(&d, 0x22, &got);
+    hidway_deframer_push(&d, 0x00, &got); /* flush garbage */
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done);
+
+    /* RELEASE normalizes to nothing held. */
+    s.type = HIDWAY_SER_RELEASE;
+    n = hidway_serial_build(&s, frame, sizeof frame);
+    hidway_deframer_reset(&d);
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done && got.mods == 0 && got.buttons == 0);
+    for (int i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
+        CHECK(got.keys[i] == 0);
+}
+
 int main(void)
 {
     test_bitmap();
     test_keymap();
     test_protocol_input();
     test_protocol_status();
+    test_crc16();
+    test_cobs();
+    test_serial();
     test_kro6_basic();
     test_kro6_reserved_usages_ignored();
     test_kro6_rollover_keeps_held_keys();
