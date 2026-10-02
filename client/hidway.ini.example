@@ -1,0 +1,8 @@
+# HIDway client configuration.
+# Copy to hidway.ini next to hidway-client.exe and edit.
+
+# Tailscale IP (or MagicDNS name) of the Raspberry Pi 4 running hidwayd.
+target = 100.100.100.100
+
+# UDP port hidwayd listens on.
+port = 47800

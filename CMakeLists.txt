@@ -11,3 +11,7 @@ set(HIDWAY_COMMON ${CMAKE_CURRENT_LIST_DIR}/common)
 
 enable_testing()
 add_subdirectory(tests)
+
+if (WIN32)
+    add_subdirectory(client)
+endif ()

@@ -1,0 +1,150 @@
+#include "keymap_sc2hid.h"
+
+#include <stdio.h>
+
+/* Non-extended Set-1 scan code -> HID usage. 0 = modifier or unmapped. */
+static const uint8_t base_usage[128] = {
+    [0x01] = 0x29, /* Esc */
+    [0x02] = 0x1E, [0x03] = 0x1F, [0x04] = 0x20, [0x05] = 0x21, [0x06] = 0x22,
+    [0x07] = 0x23, [0x08] = 0x24, [0x09] = 0x25, [0x0A] = 0x26, [0x0B] = 0x27, /* 1..0 */
+    [0x0C] = 0x2D, /* - */
+    [0x0D] = 0x2E, /* = */
+    [0x0E] = 0x2A, /* Backspace */
+    [0x0F] = 0x2B, /* Tab */
+    [0x10] = 0x14, [0x11] = 0x1A, [0x12] = 0x08, [0x13] = 0x15, [0x14] = 0x17, /* Q W E R T */
+    [0x15] = 0x1C, [0x16] = 0x18, [0x17] = 0x0C, [0x18] = 0x12, [0x19] = 0x13, /* Y U I O P */
+    [0x1A] = 0x2F, /* [ */
+    [0x1B] = 0x30, /* ] */
+    [0x1C] = 0x28, /* Enter */
+    /* 0x1D LCtrl -> modifier */
+    [0x1E] = 0x04, [0x1F] = 0x16, [0x20] = 0x07, [0x21] = 0x09, [0x22] = 0x0A, /* A S D F G */
+    [0x23] = 0x0B, [0x24] = 0x0D, [0x25] = 0x0E, [0x26] = 0x0F, /* H J K L */
+    [0x27] = 0x33, /* ; */
+    [0x28] = 0x34, /* ' */
+    [0x29] = 0x35, /* ` */
+    /* 0x2A LShift -> modifier */
+    [0x2B] = 0x31, /* backslash */
+    [0x2C] = 0x1D, [0x2D] = 0x1B, [0x2E] = 0x06, [0x2F] = 0x19, [0x30] = 0x05, /* Z X C V B */
+    [0x31] = 0x11, [0x32] = 0x10, /* N M */
+    [0x33] = 0x36, /* , */
+    [0x34] = 0x37, /* . */
+    [0x35] = 0x38, /* / */
+    /* 0x36 RShift -> modifier */
+    [0x37] = 0x55, /* Keypad * */
+    /* 0x38 LAlt -> modifier */
+    [0x39] = 0x2C, /* Space */
+    [0x3A] = 0x39, /* CapsLock */
+    [0x3B] = 0x3A, [0x3C] = 0x3B, [0x3D] = 0x3C, [0x3E] = 0x3D, [0x3F] = 0x3E, /* F1..F5 */
+    [0x40] = 0x3F, [0x41] = 0x40, [0x42] = 0x41, [0x43] = 0x42, [0x44] = 0x43, /* F6..F10 */
+    [0x45] = 0x53, /* NumLock */
+    [0x46] = 0x47, /* ScrollLock */
+    [0x47] = 0x5F, [0x48] = 0x60, [0x49] = 0x61, /* Keypad 7 8 9 */
+    [0x4A] = 0x56, /* Keypad - */
+    [0x4B] = 0x5C, [0x4C] = 0x5D, [0x4D] = 0x5E, /* Keypad 4 5 6 */
+    [0x4E] = 0x57, /* Keypad + */
+    [0x4F] = 0x59, [0x50] = 0x5A, [0x51] = 0x5B, /* Keypad 1 2 3 */
+    [0x52] = 0x62, /* Keypad 0 */
+    [0x53] = 0x63, /* Keypad . */
+    [0x56] = 0x64, /* non-US backslash */
+    [0x57] = 0x44, /* F11 */
+    [0x58] = 0x45, /* F12 */
+};
+
+/* E0-prefixed Set-1 scan code -> HID usage. 0 = modifier or unmapped. */
+static const uint8_t ext_usage[128] = {
+    [0x1C] = 0x58, /* Keypad Enter */
+    /* 0x1D RCtrl -> modifier */
+    [0x35] = 0x54, /* Keypad / */
+    /* 0x38 RAlt -> modifier */
+    [0x47] = 0x4A, /* Home */
+    [0x48] = 0x52, /* Up */
+    [0x49] = 0x4B, /* PageUp */
+    [0x4B] = 0x50, /* Left */
+    [0x4D] = 0x4F, /* Right */
+    [0x4F] = 0x4D, /* End */
+    [0x50] = 0x51, /* Down */
+    [0x51] = 0x4E, /* PageDown */
+    [0x52] = 0x49, /* Insert */
+    [0x53] = 0x4C, /* Delete */
+    /* 0x5B LGui, 0x5C RGui -> modifier */
+    [0x5D] = 0x65, /* Application (menu) */
+};
+
+uint8_t hidway_sc_to_usage(uint8_t scancode, bool e0)
+{
+    if (scancode >= 0x80)
+        return 0;
+    return e0 ? ext_usage[scancode] : base_usage[scancode];
+}
+
+uint8_t hidway_sc_to_modifier(uint8_t scancode, bool e0)
+{
+    if (!e0) {
+        switch (scancode) {
+        case 0x1D: return 0x01; /* LCtrl */
+        case 0x2A: return 0x02; /* LShift */
+        case 0x38: return 0x04; /* LAlt */
+        case 0x36: return 0x20; /* RShift (RShift has no E0 prefix) */
+        default:   return 0;
+        }
+    }
+    switch (scancode) {
+    case 0x1D: return 0x10; /* RCtrl */
+    case 0x38: return 0x40; /* RAlt (AltGr) */
+    case 0x5B: return 0x08; /* LGui */
+    case 0x5C: return 0x80; /* RGui */
+    default:   return 0;
+    }
+}
+
+const char *hidway_usage_name(uint8_t usage, char tmp[8])
+{
+    switch (usage) {
+    case 0x00: return "";
+    case 0x28: return "Enter";
+    case 0x29: return "Esc";
+    case 0x2A: return "Bksp";
+    case 0x2B: return "Tab";
+    case 0x2C: return "Space";
+    case 0x2D: return "-";
+    case 0x2E: return "=";
+    case 0x2F: return "[";
+    case 0x30: return "]";
+    case 0x31: return "\\";
+    case 0x33: return ";";
+    case 0x34: return "'";
+    case 0x35: return "`";
+    case 0x36: return ",";
+    case 0x37: return ".";
+    case 0x38: return "/";
+    case 0x39: return "Caps";
+    case 0x4F: return "Right";
+    case 0x50: return "Left";
+    case 0x51: return "Down";
+    case 0x52: return "Up";
+    case 0x49: return "Ins";
+    case 0x4A: return "Home";
+    case 0x4B: return "PgUp";
+    case 0x4C: return "Del";
+    case 0x4D: return "End";
+    case 0x4E: return "PgDn";
+    default: break;
+    }
+    if (usage >= 0x04 && usage <= 0x1D) { /* A..Z */
+        tmp[0] = (char)('A' + (usage - 0x04));
+        tmp[1] = 0;
+        return tmp;
+    }
+    if (usage >= 0x1E && usage <= 0x26) { /* 1..9 */
+        tmp[0] = (char)('1' + (usage - 0x1E));
+        tmp[1] = 0;
+        return tmp;
+    }
+    if (usage == 0x27) return "0";
+    if (usage >= 0x3A && usage <= 0x45) { /* F1..F12 */
+        snprintf(tmp, 8, "F%u", (unsigned)(usage - 0x39));
+        return tmp;
+    }
+    snprintf(tmp, 8, "0x%02X", usage);
+    return tmp;
+}

@@ -4,6 +4,7 @@
 
 #include "hidway_kbd.h"
 #include "hidway_motion.h"
+#include "keymap_sc2hid.h"
 
 static int failures;
 
@@ -182,9 +183,48 @@ static void test_motion_wheel_limit_zero(void)
     CHECK(m.wheel == 3); /* caller must clear it explicitly (boot protocol) */
 }
 
+static void test_keymap(void)
+{
+    char tmp[8];
+
+    /* Scan code -> usage, layout-independent (position based). */
+    CHECK(hidway_sc_to_usage(0x11, false) == 0x1A); /* W */
+    CHECK(hidway_sc_to_usage(0x1E, false) == 0x04); /* A */
+    CHECK(hidway_sc_to_usage(0x39, false) == 0x2C); /* Space */
+    CHECK(hidway_sc_to_usage(0x1C, false) == 0x28); /* Enter */
+    CHECK(hidway_sc_to_usage(0x58, false) == 0x45); /* F12 */
+    CHECK(hidway_sc_to_usage(0x48, true) == 0x52);  /* Up (extended) */
+    CHECK(hidway_sc_to_usage(0x1C, true) == 0x58);  /* Keypad Enter (extended) */
+
+    /* Modifiers are reported separately, never as usages. */
+    CHECK(hidway_sc_to_usage(0x1D, false) == 0);
+    CHECK(hidway_sc_to_modifier(0x1D, false) == 0x01); /* LCtrl */
+    CHECK(hidway_sc_to_modifier(0x2A, false) == 0x02); /* LShift */
+    CHECK(hidway_sc_to_modifier(0x38, false) == 0x04); /* LAlt */
+    CHECK(hidway_sc_to_modifier(0x1D, true) == 0x10);  /* RCtrl */
+    CHECK(hidway_sc_to_modifier(0x38, true) == 0x40);  /* RAlt */
+    CHECK(hidway_sc_to_modifier(0x5B, true) == 0x08);  /* LGui */
+
+    /* Same code, extended flag changes meaning (RCtrl vs LCtrl). */
+    CHECK(hidway_sc_to_modifier(0x1D, false) != hidway_sc_to_modifier(0x1D, true));
+
+    /* Unmapped / out of range. */
+    CHECK(hidway_sc_to_usage(0x00, false) == 0);
+    CHECK(hidway_sc_to_usage(0xF0, false) == 0);
+    CHECK(hidway_sc_to_modifier(0x11, false) == 0);
+
+    /* Display names. */
+    CHECK(strcmp(hidway_usage_name(0x1A, tmp), "W") == 0);
+    CHECK(strcmp(hidway_usage_name(0x2C, tmp), "Space") == 0);
+    CHECK(strcmp(hidway_usage_name(0x3A, tmp), "F1") == 0);
+    CHECK(strcmp(hidway_usage_name(0x27, tmp), "0") == 0);
+    CHECK(strcmp(hidway_usage_name(0x52, tmp), "Up") == 0);
+}
+
 int main(void)
 {
     test_bitmap();
+    test_keymap();
     test_kro6_basic();
     test_kro6_reserved_usages_ignored();
     test_kro6_rollover_keeps_held_keys();
