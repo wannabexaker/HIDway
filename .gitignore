@@ -1,0 +1,40 @@
+# Build output
+build/
+build-*/
+out/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local configuration and secrets (never commit)
+*.local.ini
+hidway.ini
+hidwayd.conf
+*.key
+*.pem
+secrets/
+.env
+
+# OS
+Thumbs.db
+.DS_Store
