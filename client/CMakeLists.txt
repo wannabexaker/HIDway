@@ -2,6 +2,7 @@
 add_executable(hidway-client WIN32
     src/main.c
     src/config.c
+    src/net.c
     ${HIDWAY_COMMON}/keymap_sc2hid.c
 )
 
@@ -14,4 +15,4 @@ if (MSVC)
     target_compile_definitions(hidway-client PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif ()
 
-target_link_libraries(hidway-client PRIVATE user32 gdi32)
+target_link_libraries(hidway-client PRIVATE user32 gdi32 ws2_32 winmm)

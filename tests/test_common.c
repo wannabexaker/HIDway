@@ -5,6 +5,7 @@
 #include "hidway_kbd.h"
 #include "hidway_motion.h"
 #include "keymap_sc2hid.h"
+#include "protocol.h"
 
 static int failures;
 
@@ -221,10 +222,85 @@ static void test_keymap(void)
     CHECK(strcmp(hidway_usage_name(0x52, tmp), "Up") == 0);
 }
 
+static void test_protocol_input(void)
+{
+    CHECK(HIDWAY_INPUT_PKT_LEN == 51);
+
+    hidway_input_pkt_t in = {0}, out;
+    in.type = HIDWAY_MSG_STATE;
+    in.session_id = 0xDEADBEEF;
+    in.seq = 0x01020304;
+    in.client_time_us = 123456789;
+    in.mods = 0x05;
+    hidway_bitmap_set(in.keys, 0x1A); /* W */
+    hidway_bitmap_set(in.keys, 0xA7); /* highest usage */
+    in.buttons = 0x13;
+    in.x = -70000;
+    in.y = 65000;
+    in.wheel = -3;
+    in.pan = 7;
+
+    uint8_t buf[HIDWAY_INPUT_PKT_LEN];
+    CHECK(hidway_input_encode(buf, &in) == HIDWAY_INPUT_PKT_LEN);
+    CHECK(buf[0] == 'H' && buf[1] == HIDWAY_PROTO_VER);
+    CHECK(hidway_input_decode(buf, sizeof buf, &out));
+    CHECK(out.session_id == in.session_id && out.seq == in.seq);
+    CHECK(out.client_time_us == in.client_time_us);
+    CHECK(out.mods == in.mods && out.buttons == in.buttons);
+    CHECK(memcmp(out.keys, in.keys, HIDWAY_KEY_BITMAP_BYTES) == 0);
+    CHECK(out.x == -70000 && out.y == 65000); /* beyond int16: needs 32-bit */
+    CHECK(out.wheel == -3 && out.pan == 7);
+
+    /* RELEASE normalizes to nothing held regardless of payload. */
+    uint8_t rel[HIDWAY_INPUT_PKT_LEN];
+    in.type = HIDWAY_MSG_RELEASE;
+    hidway_input_encode(rel, &in);
+    CHECK(hidway_input_decode(rel, sizeof rel, &out));
+    CHECK(out.mods == 0 && out.buttons == 0);
+    for (int i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
+        CHECK(out.keys[i] == 0);
+
+    /* Rejections: wrong length, magic, version, type. */
+    CHECK(!hidway_input_decode(buf, HIDWAY_INPUT_PKT_LEN - 1, &out));
+    uint8_t bad[HIDWAY_INPUT_PKT_LEN];
+    memcpy(bad, buf, sizeof bad);
+    bad[0] = 'X';
+    CHECK(!hidway_input_decode(bad, sizeof bad, &out));
+    memcpy(bad, buf, sizeof bad);
+    bad[1] = 99;
+    CHECK(!hidway_input_decode(bad, sizeof bad, &out));
+    memcpy(bad, buf, sizeof bad);
+    bad[2] = 7;
+    CHECK(!hidway_input_decode(bad, sizeof bad, &out));
+}
+
+static void test_protocol_status(void)
+{
+    CHECK(HIDWAY_STATUS_PKT_LEN == 25);
+    hidway_status_pkt_t in = {0}, out;
+    in.session_id = 0x11223344;
+    in.seq = 999;
+    in.client_time_us = 42;
+    in.frames_ok = 123456;
+    in.seq_gaps = 7;
+    in.flags = 0x0003;
+    in.leds = 0x02;
+
+    uint8_t buf[HIDWAY_STATUS_PKT_LEN];
+    CHECK(hidway_status_encode(buf, &in) == HIDWAY_STATUS_PKT_LEN);
+    CHECK(hidway_status_decode(buf, sizeof buf, &out));
+    CHECK(out.session_id == in.session_id && out.seq == in.seq);
+    CHECK(out.client_time_us == in.client_time_us && out.frames_ok == in.frames_ok);
+    CHECK(out.seq_gaps == in.seq_gaps && out.flags == in.flags && out.leds == in.leds);
+    CHECK(!hidway_status_decode(buf, 4, &out));
+}
+
 int main(void)
 {
     test_bitmap();
     test_keymap();
+    test_protocol_input();
+    test_protocol_status();
     test_kro6_basic();
     test_kro6_reserved_usages_ignored();
     test_kro6_rollover_keeps_held_keys();
