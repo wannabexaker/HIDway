@@ -32,6 +32,8 @@ hidway.ini
 hidwayd.conf
 *.key
 *.pem
+*.crt
+*.log
 secrets/
 .env
 

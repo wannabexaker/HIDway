@@ -1,70 +1,121 @@
 # HIDway
 
-Απομακρυσμένο **φυσικό** keyboard και mouse. Το gaming PC βλέπει μόνο ένα κανονικό USB HID keyboard και mouse, το Raspberry Pi Pico W. Το input έρχεται από το remote PC μέσω Tailscale και Raspberry Pi 4. Δεν τρέχει κανένα software και δεν χρειάζεται κανένας driver στο gaming PC.
+**Remote physical keyboard & mouse over a real USB HID interface.**
+
+HIDway lets you control a computer from another PC across the network, where
+the target machine sees nothing but an ordinary USB keyboard and mouse. A
+Raspberry Pi Pico acts as a genuine USB HID device; a small relay on a
+Raspberry Pi forwards input to it over an encrypted link. It is, in effect, a
+build‑it‑yourself networked KVM for keyboard and mouse.
 
 ```
-remote PC (hidway-client) → Tailscale → Pi 4 (hidwayd) → UART → Pico W (USB HID) → gaming PC
+┌──────────────────────┐     UDP over          ┌───────────────────────┐
+│  Remote PC           │     Tailscale          │  Raspberry Pi (relay)  │
+│  hidway-client  ─────┼───────────────────────▶│  hidwayd               │
+│  (reads your input)  │     (WireGuard)         │  (latest-state only)   │
+└──────────────────────┘                         └──────────┬────────────┘
+                                                            │ USB serial
+                                                 ┌──────────▼────────────┐
+                                                 │  Raspberry Pi Pico      │
+                                                 │  TinyUSB HID kbd+mouse  │
+                                                 └──────────┬──────────────┘
+                                                            │ USB
+                                                 ┌──────────▼────────────┐
+                                                 │  Target PC              │
+                                                 │  no driver, no software │
+                                                 └─────────────────────────┘
 ```
 
-Η αρχιτεκτονική, οι αποφάσεις και τα ρίσκα βρίσκονται στο [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Why
 
-## Κατάσταση: Phase 0 (go/no-go)
+Some applications and games only accept input that arrives through a real
+hardware device, and ignore input injected by software (remote‑desktop tools,
+`SendInput`, virtual HID drivers). HIDway bridges that gap honestly: the input
+you make on the remote PC is reproduced by a physical USB HID device on the
+target, exactly as if a keyboard and mouse were plugged in locally.
 
-Πριν χτιστεί οτιδήποτε άλλο, ελέγχουμε το εξής: **δέχεται το AION 2 input από το Pico ως USB HID;**
+## Design principles
 
-Το firmware του T0 στέλνει «W» και κίνηση mouse προς τα δεξιά, όσο κρατάς πατημένο το κουμπί **BOOTSEL** του Pico. Δεν χρειάζονται Pi ή δίκτυο.
+- **Pure 1:1 relay of human input.** No macros, no automation, no scripted or
+  assisted input of any kind.
+- **Honest device identity.** The Pico enumerates as a plain HID keyboard and
+  mouse under its own name. It never imitates another vendor and contains no
+  detection‑evasion or hiding mechanism.
+- **Fail‑safe everywhere.** Any lost link, timeout or crash ends in *all keys
+  and buttons released*. A key can never stick.
+- **No queues.** Every hop keeps only the latest complete state, so a lost or
+  reordered packet is corrected by the next one instead of piling up lag.
 
-### 1. Flash
+## Responsible use
 
-Το flash μπορεί να γίνει σε οποιοδήποτε PC. Μετά μεταφέρεις το Pico στο gaming PC.
+HIDway is a general‑purpose remote‑input device. You are responsible for
+complying with the terms of service and rules of any software, game or service
+you use it with. Some online games prohibit input from devices they consider
+non‑standard, regardless of intent; HIDway does not and will not attempt to
+hide what it is. Use it where you are permitted to.
 
-1. Κράτα πατημένο το **BOOTSEL** και σύνδεσε το Pico W με USB. Εμφανίζεται ένας δίσκος `RPI-RP2`.
-2. Αντέγραψε το `build\firmware\hidway_fw.uf2` στον δίσκο. Το Pico κάνει επανεκκίνηση μόνο του.
+## Components
 
-Για να ξανακάνεις flash αργότερα, επανέλαβε τα ίδια βήματα. Το BOOTSEL λειτουργεί ως κουμπί bootloader μόνο τη στιγμή που συνδέεις το Pico.
+| Part | Runs on | Purpose |
+|------|---------|---------|
+| `client/`   | Remote PC (Windows) | Reads your keyboard/mouse (Raw Input), shows an arm/disarm UI, relays the state over UDP. |
+| `relay/`    | Raspberry Pi (Linux) | `hidwayd`: receives state, keeps the latest, forwards to the Pico, releases everything on link loss. |
+| `firmware/` | Raspberry Pi Pico / Pico W | Enumerates as a USB HID keyboard + mouse (TinyUSB). |
+| `common/`   | shared | Protocol, keyboard/mouse state logic, scan‑code→HID map. Pure C11, unit‑tested on the host. |
+| `tests/`    | host | Unit tests for `common/` (ctest). |
 
-### 2. LED
-
-| LED | Σημασία |
-|---|---|
-| Αργό αναβόσβημα | περιμένει τον USB host |
-| Σταθερό | συνδεδεμένο, έτοιμο |
-| Γρήγορο αναβόσβημα | το BOOTSEL είναι πατημένο και στέλνει input |
-| Σβηστό | το PC είναι σε sleep |
-
-### 3. Το τεστ (T0)
-
-1. Σύνδεσε το Pico σε **πίσω** θύρα USB του gaming PC.
-2. **Device Manager:** Πρέπει να εμφανιστούν τα «HID Keyboard Device» και «HID-compliant mouse» χωρίς εγκατάσταση driver.
-3. **Notepad:** Κράτα το BOOTSEL. Πρέπει να γράφει `wwww` και ο κέρσορας να φεύγει γρήγορα προς τα δεξιά.
-4. **AION 2:** Μέσα στο game, κράτα το BOOTSEL.
-   - Ο χαρακτήρας πρέπει να περπατά μπροστά.
-   - Ο κέρσορας ή η κάμερα πρέπει να κινείται. Αν η κάμερα γυρίζει μόνο με πατημένο το δεξί κλικ, κράτα το δεξί κλικ του κανονικού σου mouse ταυτόχρονα.
-5. Παίξε περίπου 30 λεπτά με το Pico συνδεδεμένο και πρόσεξε αν εμφανιστεί κάποιο warning ή αποσύνδεση.
-
-**Αποτέλεσμα:**
-- Αν το input δουλεύει στο Notepad αλλά **όχι** μέσα στο game, το παιχνίδι φιλτράρει τη συσκευή και σταματάμε εδώ.
-- Αν δουλεύει και στα δύο, προχωράμε στην Phase 1, το prototype στο LAN.
+The transport uses [Tailscale](https://tailscale.com/) (WireGuard) so the HID
+endpoint is never exposed to the public internet and traffic is authenticated
+and encrypted end to end.
 
 ## Build
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1
+### Host unit tests (any platform with a C compiler + CMake)
+
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Χρειάζονται τα εξής:
-- Visual Studio με το C++ workload (cl, CMake, Ninja).
-- Pico SDK 2.3.1 στο `~\.pico-sdk\sdk\2.3.1`.
-- Arm GNU toolchain 14.2 στο `~\.pico-sdk\toolchain\14_2_Rel1`.
+### Windows client
 
-Είναι η ίδια δομή φακέλων με το VS Code extension «Raspberry Pi Pico».
+Built as part of the host build above (requires the MSVC toolchain). Output:
+`build/client/hidway-client.exe`. Copy `client/hidway.ini.example` to
+`hidway.ini` next to the executable and set your relay address.
 
-## Δομή
+### Pico firmware
 
+Requires the [Pico SDK](https://github.com/raspberrypi/pico-sdk) and the Arm
+GNU toolchain.
+
+```bash
+cmake -S firmware -B build/firmware -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/firmware
+# flash build/firmware/hidway_fw.uf2 via BOOTSEL
 ```
-common/    κοινή C λογική (keyboard 6KRO slots, motion accumulator)
-firmware/  Pico W firmware (Pico SDK + TinyUSB)
-tests/     host unit tests για το common/ (ctest)
-tools/     build script
-docs/      αρχιτεκτονική
+
+On Windows, `tools/build.ps1` builds both the firmware and the host tests.
+
+### Relay (`hidwayd`) on the Raspberry Pi
+
+```bash
+cd relay
+make
+./hidwayd --bind <pi-tailscale-ip> --allow <client-tailscale-ip> --port 47800
 ```
+
+## Status
+
+Early development. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan and
+[docs/CHECKLIST.md](docs/CHECKLIST.md) for progress. The full design, trade‑offs
+and what is proven vs. unverified is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model and how to report issues.
+
+## License
+
+[MIT](LICENSE).
