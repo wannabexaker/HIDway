@@ -13,9 +13,14 @@
  *
  * The on-screen "recent input" list is in memory only, never written to disk,
  * and cleared on exit.
+ *
+ * The look is hand-drawn (owner-draw + a double-buffered WM_PAINT): dark cards,
+ * a green accent, a status pill and monospace readouts, with a translucent,
+ * rounded, dark-titlebar window.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dwmapi.h>
 #include <timeapi.h>
 
 #include <stdarg.h>
@@ -30,23 +35,44 @@
 #include "protocol.h"
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
 
 #define HK_TOGGLE 1
 #define HK_PANIC  2
 #define TIMER_UI  1
 #define TIMER_NET 2
 #define UI_REFRESH_MS 50
-
 #define HISTORY_MAX 60
 
 enum {
-    ID_STATUS = 1001, ID_HEALTH, ID_BODY, ID_HISTLABEL, ID_HISTORY, ID_CLEAR,
-    ID_SETLABEL, ID_LTARGET, ID_TARGET, ID_LPORT, ID_PORT, ID_LRATE, ID_RATE,
-    ID_LAUTO, ID_AUTO, ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_HOTKEYS,
-    ID_SAVE, ID_ARM, ID_PANIC
+    ID_HISTORY = 1001, ID_CLEAR, ID_TARGET, ID_PORT, ID_RATE, ID_AUTO,
+    ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_SAVE, ID_ARM, ID_PANIC
 };
 
 enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
+
+/* ---- palette (ui-ux-pro-max: dark developer control panel) -------------- */
+#define C_BG      RGB(15, 23, 42)    /* #0F172A */
+#define C_CARD    RGB(30, 41, 59)    /* #1E293B */
+#define C_FIELD   RGB(36, 49, 69)    /* inputs */
+#define C_BORDER  RGB(51, 65, 85)    /* #334155 */
+#define C_ACCENT  RGB(34, 197, 94)   /* #22C55E */
+#define C_ACCENT2 RGB(52, 211, 120)  /* hover */
+#define C_AMBER   RGB(245, 158, 11)
+#define C_DANGER  RGB(239, 68, 68)
+#define C_DANGER2 RGB(248, 113, 113)
+#define C_TEXT    RGB(248, 250, 252)  /* #F8FAFC */
+#define C_DIM     RGB(148, 163, 184)  /* #94A3B8 */
 
 static struct {
     hidway_config_t cfg;
@@ -75,17 +101,13 @@ static struct {
     uint32_t last_status_us;
     uint32_t armed_at_ms;
 
-    HWND status, health, body, histlabel, history, clear;
-    HWND setlabel, target, port, rate, autoed, cb_kbd, cb_mouse, cb_hist, hotkeys, save, arm, panic;
-    HFONT font_big, font_mono, font_ui;
-    HBRUSH bg;
+    HWND hwnd;
+    HWND history, clear, target, port, rate, autoed, cb_kbd, cb_mouse, cb_hist, save, arm, panic;
+    HFONT f_big, f_mono, f_ui, f_title;
+    HBRUSH b_bg, b_card, b_field;
 } g;
 
-static const COLORREF C_BG = RGB(24, 26, 30);
-static const COLORREF C_TXT = RGB(225, 228, 233);
-static const COLORREF C_DIM = RGB(140, 145, 155);
-
-/* --------------------------------------------------------------- helpers */
+/* ---------------------------------------------------------------- helpers */
 
 static void append(char *dst, size_t cap, const char *fmt, ...)
 {
@@ -105,7 +127,7 @@ static void history_add(const char *ev)
     SYSTEMTIME st;
     GetLocalTime(&st);
     char line[96];
-    snprintf(line, sizeof line, "%02d:%02d:%02d.%03d  %s",
+    snprintf(line, sizeof line, "%02d:%02d:%02d.%03d   %s",
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, ev);
     SendMessageA(g.history, LB_INSERTSTRING, 0, (LPARAM)line);
     int n = (int)SendMessageA(g.history, LB_GETCOUNT, 0, 0);
@@ -165,9 +187,9 @@ static void net_drain_status(void)
     }
 }
 
-static void set_armed(HWND hwnd, int on);
+static void set_armed(int on);
 
-static void net_tick(HWND hwnd)
+static void net_tick(void)
 {
     net_send_state(HIDWAY_MSG_STATE);
     net_drain_status();
@@ -178,11 +200,9 @@ static void net_tick(HWND hwnd)
         g.sent_in_sec = 0;
         g.sec_start_us = now;
     }
-
-    /* Auto-disarm if the link was up and then went silent. */
     if (g.armed && g.status_seen && g.cfg.auto_disarm_ms > 0 &&
         (now - g.last_status_us) > (uint32_t)g.cfg.auto_disarm_ms * 1000u) {
-        set_armed(hwnd, 0);
+        set_armed(0);
         history_add("auto-disarmed (link lost)");
     }
 }
@@ -202,7 +222,7 @@ static int net_interval_ms(void)
     return ms < 1 ? 1 : ms;
 }
 
-static void set_armed(HWND hwnd, int on)
+static void set_armed(int on)
 {
     if (on == g.armed)
         return;
@@ -216,59 +236,48 @@ static void set_armed(HWND hwnd, int on)
         g.rtt_ms = -1;
         g.armed_at_ms = timeGetTime();
         net_send_state(HIDWAY_MSG_STATE);
-        SetTimer(hwnd, TIMER_NET, net_interval_ms(), NULL);
+        SetTimer(g.hwnd, TIMER_NET, net_interval_ms(), NULL);
     } else {
         for (int i = 0; i < 3; i++)
             net_send_state(HIDWAY_MSG_RELEASE);
-        KillTimer(hwnd, TIMER_NET);
+        KillTimer(g.hwnd, TIMER_NET);
         g.pps = 0;
     }
-
-    SetWindowTextA(g.status, on ? "  ARMED" : "  DISARMED");
-    SetWindowTextA(g.arm, on ? "DISARM" : "ARM");
-    InvalidateRect(g.status, NULL, TRUE);
+    InvalidateRect(g.arm, NULL, TRUE);
+    InvalidateRect(g.hwnd, NULL, FALSE);
 }
+
+static const struct { uint8_t bit; const char *name; } MODS[] = {
+    {0x01, "LCtrl"}, {0x02, "LShift"}, {0x04, "LAlt"}, {0x08, "LGui"},
+    {0x10, "RCtrl"}, {0x20, "RShift"}, {0x40, "RAlt"}, {0x80, "RGui"},
+};
 
 static void on_raw_keyboard(const RAWKEYBOARD *kb)
 {
     if (!g.armed || !g.cfg.relay_keyboard || kb->MakeCode == 0 || kb->MakeCode == 0xFF)
         return;
-
     bool e0 = (kb->Flags & RI_KEY_E0) != 0;
     bool up = (kb->Flags & RI_KEY_BREAK) != 0;
     uint8_t sc = (uint8_t)kb->MakeCode;
 
-    static const struct { uint8_t bit; const char *name; } mods[] = {
-        {0x01, "LCtrl"}, {0x02, "LShift"}, {0x04, "LAlt"}, {0x08, "LGui"},
-        {0x10, "RCtrl"}, {0x20, "RShift"}, {0x40, "RAlt"}, {0x80, "RGui"},
-    };
-
     uint8_t mod = hidway_sc_to_modifier(sc, e0);
     if (mod) {
         bool was = (g.modifiers & mod) != 0;
-        if (up)
-            g.modifiers &= (uint8_t)~mod;
-        else
-            g.modifiers |= mod;
-        if (was != !up) {
+        if (up) g.modifiers &= (uint8_t)~mod; else g.modifiers |= mod;
+        if (was != !up)
             for (int i = 0; i < 8; i++)
-                if (mods[i].bit == mod) {
+                if (MODS[i].bit == mod) {
                     char ev[24];
-                    snprintf(ev, sizeof ev, "%s %s", mods[i].name, up ? "up" : "down");
+                    snprintf(ev, sizeof ev, "%s %s", MODS[i].name, up ? "up" : "down");
                     history_add(ev);
                 }
-        }
         return;
     }
-
     uint8_t usage = hidway_sc_to_usage(sc, e0);
     if (!usage)
         return;
     bool was = hidway_bitmap_test(g.keys, usage);
-    if (up)
-        hidway_bitmap_clear(g.keys, usage);
-    else
-        hidway_bitmap_set(g.keys, usage);
+    if (up) hidway_bitmap_clear(g.keys, usage); else hidway_bitmap_set(g.keys, usage);
     if (was != !up) {
         char tmp[8], ev[24];
         snprintf(ev, sizeof ev, "%s %s", hidway_usage_name(usage, tmp), up ? "up" : "down");
@@ -276,39 +285,27 @@ static void on_raw_keyboard(const RAWKEYBOARD *kb)
     }
 }
 
-static void mouse_button_edge(USHORT bf, USHORT downf, USHORT upf, uint8_t bit, const char *name)
+static void mouse_edge(USHORT bf, USHORT d, USHORT u, uint8_t bit, const char *name)
 {
-    if (bf & downf) {
-        g.buttons |= bit;
-        char ev[24];
-        snprintf(ev, sizeof ev, "%s down", name);
-        history_add(ev);
-    }
-    if (bf & upf) {
-        g.buttons &= (uint8_t)~bit;
-        char ev[24];
-        snprintf(ev, sizeof ev, "%s up", name);
-        history_add(ev);
-    }
+    char ev[24];
+    if (bf & d) { g.buttons |= bit; snprintf(ev, sizeof ev, "%s down", name); history_add(ev); }
+    if (bf & u) { g.buttons &= (uint8_t)~bit; snprintf(ev, sizeof ev, "%s up", name); history_add(ev); }
 }
 
 static void on_raw_mouse(const RAWMOUSE *m)
 {
     if (!g.armed || !g.cfg.relay_mouse)
         return;
-
     if (!(m->usFlags & MOUSE_MOVE_ABSOLUTE)) {
         g.cum_x += m->lLastX;
         g.cum_y += m->lLastY;
     }
-
     USHORT bf = m->usButtonFlags;
-    mouse_button_edge(bf, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, BTN_L, "LMB");
-    mouse_button_edge(bf, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, BTN_R, "RMB");
-    mouse_button_edge(bf, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, BTN_M, "MMB");
-    mouse_button_edge(bf, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, BTN_X1, "MB4");
-    mouse_button_edge(bf, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, BTN_X2, "MB5");
-
+    mouse_edge(bf, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, BTN_L, "LMB");
+    mouse_edge(bf, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, BTN_R, "RMB");
+    mouse_edge(bf, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, BTN_M, "MMB");
+    mouse_edge(bf, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, BTN_X1, "MB4");
+    mouse_edge(bf, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, BTN_X2, "MB5");
     if (bf & RI_MOUSE_WHEEL) {
         g.wheel_rem_v += (SHORT)m->usButtonData;
         g.cum_wheel = (int16_t)(g.cum_wheel + g.wheel_rem_v / WHEEL_DELTA);
@@ -341,85 +338,225 @@ static void on_raw_input(HRAWINPUT h)
         free(buf);
 }
 
-/* --------------------------------------------------------------- display */
+/* --------------------------------------------------------------- drawing */
 
-static void refresh_health(void)
+static void fill_round(HDC dc, int l, int t, int r, int b, int rad, COLORREF fill, COLORREF border)
 {
-    char s[512];
-    s[0] = 0;
-
-    if (!g.net_ok) {
-        append(s, sizeof s, "socket error - check target in Settings");
-        SetWindowTextA(g.health, s);
-        return;
-    }
-    if (!g.armed) {
-        append(s, sizeof s, "idle - not sending\r\ntarget %s:%d", g.cfg.target, g.cfg.port);
-        SetWindowTextA(g.health, s);
-        return;
-    }
-
-    if (!g.status_seen) {
-        append(s, sizeof s, "sending %u/s - waiting for relay reply...", g.pps);
-    } else {
-        double total = (double)g.pi_frames_ok + (double)g.pi_gaps;
-        double loss = total > 0 ? 100.0 * g.pi_gaps / total : 0.0;
-        append(s, sizeof s, "RTT %d ms   loss %.1f%%   %u pkt/s\r\n", g.rtt_ms, loss, g.pps);
-        append(s, sizeof s, "relay serial: %s   Pi ok=%u gaps=%u",
-               (g.pi_flags & 0x0002) ? "open" : "none", g.pi_frames_ok, g.pi_gaps);
-    }
-    unsigned secs = (timeGetTime() - g.armed_at_ms) / 1000;
-    append(s, sizeof s, "   armed %u:%02u", secs / 60, secs % 60);
-    SetWindowTextA(g.health, s);
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pen);
+    RoundRect(dc, l, t, r, b, rad * 2, rad * 2);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
 }
 
-static void refresh_body(void)
+static void draw_text(HDC dc, HFONT f, COLORREF col, int x, int y, const char *s)
 {
-    refresh_health();
+    SelectObject(dc, f);
+    SetTextColor(dc, col);
+    SetBkMode(dc, TRANSPARENT);
+    TextOutA(dc, x, y, s, (int)strlen(s));
+}
 
-    char s[768];
-    s[0] = 0;
+static void draw_text_rect(HDC dc, HFONT f, COLORREF col, RECT *r, UINT fmt, const char *s)
+{
+    SelectObject(dc, f);
+    SetTextColor(dc, col);
+    SetBkMode(dc, TRANSPARENT);
+    DrawTextA(dc, s, -1, r, fmt);
+}
+
+static void paint(HWND hwnd)
+{
+    RECT cr;
+    GetClientRect(hwnd, &cr);
+
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, cr.right, cr.bottom);
+    HGDIOBJ obmp = SelectObject(dc, bmp);
+
+    FillRect(dc, &cr, g.b_bg);
+
+    const int X = 16, W = cr.right - 32;
+
+    /* Header card: status pill + health readout. */
+    fill_round(dc, X, 14, X + W, 110, 12, C_CARD, C_BORDER);
+    COLORREF pill = g.armed ? C_ACCENT : C_BORDER;
+    fill_round(dc, X + 16, 28, X + 16 + 168, 64, 16, pill, pill);
+    /* status dot */
+    HBRUSH dot = CreateSolidBrush(g.armed ? RGB(12, 40, 22) : C_DIM);
+    HGDIOBJ od = SelectObject(dc, dot);
+    HPEN np = CreatePen(PS_SOLID, 1, g.armed ? RGB(12, 40, 22) : C_DIM);
+    HGDIOBJ opn = SelectObject(dc, np);
+    Ellipse(dc, X + 30, 40, X + 42, 52);
+    SelectObject(dc, od);
+    SelectObject(dc, opn);
+    DeleteObject(dot);
+    DeleteObject(np);
+    draw_text(dc, g.f_big, g.armed ? RGB(8, 32, 18) : C_TEXT, X + 52, 33, g.armed ? "ARMED" : "DISARMED");
+
+    char line1[256] = "", line2[256] = "";
+    if (!g.net_ok) {
+        snprintf(line1, sizeof line1, "socket error - check Target in settings");
+    } else if (!g.armed) {
+        snprintf(line1, sizeof line1, "idle - not sending");
+        snprintf(line2, sizeof line2, "target  %s:%d", g.cfg.target, g.cfg.port);
+    } else if (!g.status_seen) {
+        snprintf(line1, sizeof line1, "sending %u/s   waiting for relay reply...", g.pps);
+        unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
+        snprintf(line2, sizeof line2, "armed  %u:%02u", s / 60, s % 60);
+    } else {
+        double tot = (double)g.pi_frames_ok + g.pi_gaps;
+        double loss = tot > 0 ? 100.0 * g.pi_gaps / tot : 0.0;
+        unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
+        snprintf(line1, sizeof line1, "RTT %d ms    loss %.1f%%    %u pkt/s", g.rtt_ms, loss, g.pps);
+        snprintf(line2, sizeof line2, "relay serial %s    Pi ok=%u gaps=%u    armed %u:%02u",
+                 (g.pi_flags & 0x0002) ? "open" : "none", g.pi_frames_ok, g.pi_gaps, s / 60, s % 60);
+    }
+    draw_text(dc, g.f_mono, g.armed ? C_ACCENT2 : C_DIM, X + 200, 30, line1);
+    draw_text(dc, g.f_mono, C_DIM, X + 200, 50, line2);
+    draw_text(dc, g.f_mono, C_TEXT, X + 16, 76, line1[0] && !g.armed ? line2 : "");
+
+    /* Live card. */
+    int ly = 120;
+    fill_round(dc, X, ly, X + W, ly + 104, 12, C_CARD, C_BORDER);
+    draw_text(dc, g.f_title, C_DIM, X + 16, ly + 10, "LIVE");
     if (!g.armed) {
-        append(s, sizeof s, "Disarmed. Keyboard and mouse are not being read.");
-        SetWindowTextA(g.body, s);
+        draw_text(dc, g.f_mono, C_DIM, X + 16, ly + 44, "Disarmed - keyboard and mouse are not being read.");
+    } else {
+        char s[256];
+        int any = 0;
+        s[0] = 0;
+        strcpy(s, "mods  ");
+        for (int i = 0; i < 8; i++)
+            if (g.modifiers & MODS[i].bit) { append(s, sizeof s, "%s%s", any ? " " : "", MODS[i].name); any = 1; }
+        if (!any) strcat(s, "-");
+        draw_text(dc, g.f_mono, C_TEXT, X + 16, ly + 34, s);
+
+        strcpy(s, "keys  "); any = 0;
+        for (unsigned u = HIDWAY_KEY_USAGE_MIN; u <= HIDWAY_KEY_USAGE_MAX; u++)
+            if (hidway_bitmap_test(g.keys, (uint8_t)u)) {
+                char t[8];
+                append(s, sizeof s, "%s%s", any ? " " : "", hidway_usage_name((uint8_t)u, t));
+                any = 1;
+            }
+        if (!any) strcat(s, "-");
+        draw_text(dc, g.f_mono, C_TEXT, X + 16, ly + 52, s);
+
+        snprintf(s, sizeof s, "btn   %s%s%s%s%s",
+                 (g.buttons & BTN_L) ? "L " : "", (g.buttons & BTN_R) ? "R " : "",
+                 (g.buttons & BTN_M) ? "M " : "", (g.buttons & BTN_X1) ? "4 " : "",
+                 (g.buttons & BTN_X2) ? "5" : "");
+        if (!g.buttons) strcpy(s, "btn   -");
+        draw_text(dc, g.f_mono, C_TEXT, X + 16, ly + 70, s);
+
+        snprintf(s, sizeof s, "move  dx=%+ld dy=%+ld   wheel v=%+d h=%+d",
+                 (long)(g.cum_x - g.disp_x), (long)(g.cum_y - g.disp_y),
+                 (int)(int16_t)(g.cum_wheel - g.disp_wheel), (int)(int16_t)(g.cum_pan - g.disp_pan));
+        draw_text(dc, g.f_mono, C_ACCENT2, X + 16, ly + 88, s);
+        g.disp_x = g.cum_x; g.disp_y = g.cum_y; g.disp_wheel = g.cum_wheel; g.disp_pan = g.cum_pan;
+    }
+
+    /* History card title (listbox is a child positioned inside). */
+    int hy = 232;
+    fill_round(dc, X, hy, X + W, hy + 180, 12, C_CARD, C_BORDER);
+    draw_text(dc, g.f_title, C_DIM, X + 16, hy + 10, "RECENT INPUT   (memory only)");
+
+    /* Settings card. */
+    int sy = 424;
+    fill_round(dc, X, sy, X + W, sy + 146, 12, C_CARD, C_BORDER);
+    draw_text(dc, g.f_title, C_DIM, X + 16, sy + 10, "SETTINGS");
+    draw_text(dc, g.f_ui, C_DIM, X + 16, sy + 40, "Target");
+    draw_text(dc, g.f_ui, C_DIM, X + 300, sy + 40, "Port");
+    draw_text(dc, g.f_ui, C_DIM, X + 16, sy + 74, "Rate Hz");
+    draw_text(dc, g.f_ui, C_DIM, X + 150, sy + 74, "Auto-disarm ms");
+    char hk[160];
+    snprintf(hk, sizeof hk, "toggle  %s        panic  %s", g.cfg.toggle.text, g.cfg.panic.text);
+    draw_text(dc, g.f_mono, C_DIM, X + 16, sy + 118, hk);
+
+    BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, obmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+/* Owner-draw buttons and checkboxes. Hover is tracked via a per-window prop. */
+static void draw_button(LPDRAWITEMSTRUCT d)
+{
+    int id = (int)d->CtlID;
+    RECT r = d->rcItem;
+    bool pressed = (d->itemState & ODS_SELECTED) != 0;
+    bool hot = GetPropA(d->hwndItem, "hot") != NULL;
+
+    if (id == ID_CB_KBD || id == ID_CB_MOUSE || id == ID_CB_HIST) {
+        int checked = (id == ID_CB_KBD) ? g.cfg.relay_keyboard
+                    : (id == ID_CB_MOUSE) ? g.cfg.relay_mouse : g.cfg.history_enabled;
+        char label[32];
+        GetWindowTextA(d->hwndItem, label, sizeof label);
+        int box = 18, by = r.top + (r.bottom - r.top - box) / 2;
+        fill_round(d->hDC, r.left, by, r.left + box, by + box, 5,
+                   checked ? C_ACCENT : C_FIELD, checked ? C_ACCENT : C_BORDER);
+        if (checked) {
+            HPEN p = CreatePen(PS_SOLID, 2, RGB(8, 32, 18));
+            HGDIOBJ op = SelectObject(d->hDC, p);
+            MoveToEx(d->hDC, r.left + 4, by + 9, NULL);
+            LineTo(d->hDC, r.left + 8, by + 13);
+            LineTo(d->hDC, r.left + 14, by + 5);
+            SelectObject(d->hDC, op);
+            DeleteObject(p);
+        }
+        draw_text(d->hDC, g.f_ui, hot ? C_TEXT : C_DIM, r.left + box + 8, by + 1, label);
         return;
     }
 
-    append(s, sizeof s, "Modifiers : ");
-    static const struct { uint8_t bit; const char *name; } mods[] = {
-        {0x01, "LCtrl"}, {0x02, "LShift"}, {0x04, "LAlt"}, {0x08, "LGui"},
-        {0x10, "RCtrl"}, {0x20, "RShift"}, {0x40, "RAlt"}, {0x80, "RGui"},
-    };
-    int any = 0;
-    for (int i = 0; i < 8; i++)
-        if (g.modifiers & mods[i].bit) { append(s, sizeof s, "%s%s", any ? " " : "", mods[i].name); any = 1; }
-    append(s, sizeof s, "%s\r\n", any ? "" : "-");
+    COLORREF fill, txt = C_TEXT, border;
+    if (id == ID_ARM) {
+        fill = g.armed ? C_AMBER : C_ACCENT;
+        if (hot) fill = g.armed ? RGB(251, 180, 50) : C_ACCENT2;
+        txt = RGB(8, 24, 14);
+        border = fill;
+    } else if (id == ID_PANIC) {
+        fill = hot ? C_DANGER2 : C_DANGER;
+        txt = RGB(40, 10, 10);
+        border = fill;
+    } else { /* SAVE, CLEAR: subtle */
+        fill = hot ? C_BORDER : C_FIELD;
+        txt = C_TEXT;
+        border = C_BORDER;
+    }
+    if (pressed) {
+        fill = RGB(GetRValue(fill) * 8 / 10, GetGValue(fill) * 8 / 10, GetBValue(fill) * 8 / 10);
+    }
+    fill_round(d->hDC, r.left, r.top, r.right, r.bottom, 9, fill, border);
 
-    append(s, sizeof s, "Keys      : ");
-    any = 0;
-    for (unsigned u = HIDWAY_KEY_USAGE_MIN; u <= HIDWAY_KEY_USAGE_MAX; u++)
-        if (hidway_bitmap_test(g.keys, (uint8_t)u)) {
-            char tmp[8];
-            append(s, sizeof s, "%s%s", any ? " " : "", hidway_usage_name((uint8_t)u, tmp));
-            any = 1;
+    char label[32];
+    GetWindowTextA(d->hwndItem, label, sizeof label);
+    if (id == ID_ARM)
+        strcpy(label, g.armed ? "DISARM" : "ARM");
+    HFONT f = (id == ID_ARM || id == ID_PANIC) ? g.f_big : g.f_ui;
+    draw_text_rect(d->hDC, f, txt, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, label);
+}
+
+static LRESULT CALLBACK btn_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC orig = (WNDPROC)GetPropA(h, "op");
+    if (msg == WM_MOUSEMOVE) {
+        if (!GetPropA(h, "hot")) {
+            SetPropA(h, "hot", (HANDLE)1);
+            TRACKMOUSEEVENT tme = {sizeof tme, TME_LEAVE, h, 0};
+            TrackMouseEvent(&tme);
+            InvalidateRect(h, NULL, TRUE);
         }
-    append(s, sizeof s, "%s\r\n", any ? "" : "-");
-
-    append(s, sizeof s, "Buttons   : ");
-    if (g.buttons)
-        append(s, sizeof s, "%s%s%s%s%s\r\n",
-               (g.buttons & BTN_L) ? "L " : "", (g.buttons & BTN_R) ? "R " : "",
-               (g.buttons & BTN_M) ? "M " : "", (g.buttons & BTN_X1) ? "4 " : "",
-               (g.buttons & BTN_X2) ? "5" : "");
-    else
-        append(s, sizeof s, "-\r\n");
-
-    append(s, sizeof s, "Move 50ms : dx=%+ld dy=%+ld   wheel v=%+d h=%+d",
-           (long)(g.cum_x - g.disp_x), (long)(g.cum_y - g.disp_y),
-           (int)(int16_t)(g.cum_wheel - g.disp_wheel), (int)(int16_t)(g.cum_pan - g.disp_pan));
-    g.disp_x = g.cum_x; g.disp_y = g.cum_y; g.disp_wheel = g.cum_wheel; g.disp_pan = g.cum_pan;
-
-    SetWindowTextA(g.body, s);
+    } else if (msg == WM_MOUSELEAVE) {
+        RemovePropA(h, "hot");
+        InvalidateRect(h, NULL, TRUE);
+    }
+    return CallWindowProcA(orig, h, msg, wp, lp);
 }
 
 /* --------------------------------------------------------------- settings */
@@ -432,7 +569,7 @@ static int get_int(HWND edit, int fallback)
     return v ? v : fallback;
 }
 
-static void apply_settings(HWND hwnd)
+static void apply_settings(void)
 {
     char old_target[128];
     int old_port = g.cfg.port;
@@ -443,17 +580,12 @@ static void apply_settings(HWND hwnd)
     g.cfg.send_rate_hz = get_int(g.rate, g.cfg.send_rate_hz);
     g.cfg.auto_disarm_ms = get_int(g.autoed, 0);
     if (g.cfg.auto_disarm_ms < 0) g.cfg.auto_disarm_ms = 0;
-    g.cfg.relay_keyboard = (int)SendMessageA(g.cb_kbd, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g.cfg.relay_mouse = (int)SendMessageA(g.cb_mouse, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g.cfg.history_enabled = (int)SendMessageA(g.cb_hist, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     hidway_config_save("hidway.ini", &g.cfg);
-
     if (strcmp(old_target, g.cfg.target) != 0 || old_port != g.cfg.port)
         g.net_ok = (hidway_net_open(g.cfg.target, g.cfg.port) == 0);
     if (g.armed)
-        SetTimer(hwnd, TIMER_NET, net_interval_ms(), NULL);
-
+        SetTimer(g.hwnd, TIMER_NET, net_interval_ms(), NULL);
     history_add("settings saved");
 }
 
@@ -466,53 +598,46 @@ static HWND mk(HWND p, const char *cls, const char *txt, DWORD style, int x, int
     return c;
 }
 
+static void subclass_btn(HWND b)
+{
+    WNDPROC op = (WNDPROC)SetWindowLongPtrA(b, GWLP_WNDPROC, (LONG_PTR)btn_proc);
+    SetPropA(b, "op", (HANDLE)op);
+}
+
 static void create_controls(HWND h)
 {
-    g.font_big = CreateFontA(32, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FF_SWISS, "Segoe UI");
-    g.font_mono = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-    g.font_ui = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    g.f_big = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FF_SWISS, "Segoe UI Semibold");
+    g.f_mono = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    g.f_ui = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FF_SWISS, "Segoe UI");
+    g.f_title = CreateFontA(13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FF_SWISS, "Segoe UI");
 
-    g.status = mk(h, "STATIC", "  DISARMED", SS_LEFT | SS_CENTERIMAGE, 14, 8, 300, 40, ID_STATUS, g.font_big);
-    g.health = mk(h, "STATIC", "", SS_LEFT, 16, 52, 492, 54, ID_HEALTH, g.font_mono);
-    g.body = mk(h, "STATIC", "", SS_LEFT, 16, 112, 492, 96, ID_BODY, g.font_mono);
+    const int X = 16, W = 492;
 
-    g.histlabel = mk(h, "STATIC", "Recent input (memory only):", SS_LEFT, 16, 214, 320, 18, ID_HISTLABEL, g.font_ui);
-    g.clear = mk(h, "BUTTON", "Clear", BS_PUSHBUTTON, 412, 210, 96, 24, ID_CLEAR, g.font_ui);
-    g.history = mk(h, "LISTBOX", "", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER, 16, 236, 492, 150, ID_HISTORY, g.font_mono);
+    g.history = mk(h, "LISTBOX", "", LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL, X + 12, 264, W - 24, 138, ID_HISTORY, g.f_mono);
+    g.clear = mk(h, "BUTTON", "Clear", BS_OWNERDRAW, X + W - 96, 234, 84, 22, ID_CLEAR, g.f_ui);
 
-    g.setlabel = mk(h, "STATIC", "Settings", SS_LEFT, 16, 396, 200, 18, ID_SETLABEL, g.font_ui);
-    mk(h, "STATIC", "Target", SS_LEFT, 16, 422, 50, 20, ID_LTARGET, g.font_ui);
-    g.target = mk(h, "EDIT", g.cfg.target, ES_AUTOHSCROLL | WS_BORDER, 70, 420, 236, 24, ID_TARGET, g.font_ui);
-    mk(h, "STATIC", "Port", SS_LEFT, 318, 422, 32, 20, ID_LPORT, g.font_ui);
-    g.port = mk(h, "EDIT", "", ES_NUMBER | WS_BORDER, 352, 420, 60, 24, ID_PORT, g.font_ui);
+    int sy = 424;
+    g.target = mk(h, "EDIT", g.cfg.target, ES_AUTOHSCROLL, X + 74, sy + 38, 214, 24, ID_TARGET, g.f_ui);
+    g.port = mk(h, "EDIT", "", ES_NUMBER, X + 336, sy + 38, 64, 24, ID_PORT, g.f_ui);
+    g.rate = mk(h, "EDIT", "", ES_NUMBER, X + 80, sy + 72, 56, 24, ID_RATE, g.f_ui);
+    g.autoed = mk(h, "EDIT", "", ES_NUMBER, X + 268, sy + 72, 70, 24, ID_AUTO, g.f_ui);
 
-    mk(h, "STATIC", "Rate Hz", SS_LEFT, 16, 454, 54, 20, ID_LRATE, g.font_ui);
-    g.rate = mk(h, "EDIT", "", ES_NUMBER | WS_BORDER, 74, 452, 56, 24, ID_RATE, g.font_ui);
-    mk(h, "STATIC", "Auto-disarm ms (0=off)", SS_LEFT, 150, 454, 160, 20, ID_LAUTO, g.font_ui);
-    g.autoed = mk(h, "EDIT", "", ES_NUMBER | WS_BORDER, 318, 452, 70, 24, ID_AUTO, g.font_ui);
+    g.cb_kbd = mk(h, "BUTTON", "Keyboard", BS_OWNERDRAW, X + 16, sy + 98, 120, 22, ID_CB_KBD, g.f_ui);
+    g.cb_mouse = mk(h, "BUTTON", "Mouse", BS_OWNERDRAW, X + 146, sy + 98, 110, 22, ID_CB_MOUSE, g.f_ui);
+    g.cb_hist = mk(h, "BUTTON", "History", BS_OWNERDRAW, X + 262, sy + 98, 100, 22, ID_CB_HIST, g.f_ui);
+    g.save = mk(h, "BUTTON", "Save", BS_OWNERDRAW, X + W - 96, sy + 96, 84, 26, ID_SAVE, g.f_ui);
 
-    g.cb_kbd = mk(h, "BUTTON", "Relay keyboard", BS_AUTOCHECKBOX, 16, 486, 140, 20, ID_CB_KBD, g.font_ui);
-    g.cb_mouse = mk(h, "BUTTON", "Relay mouse", BS_AUTOCHECKBOX, 164, 486, 120, 20, ID_CB_MOUSE, g.font_ui);
-    g.cb_hist = mk(h, "BUTTON", "History", BS_AUTOCHECKBOX, 292, 486, 90, 20, ID_CB_HIST, g.font_ui);
-    g.save = mk(h, "BUTTON", "Save", BS_PUSHBUTTON, 412, 482, 96, 26, ID_SAVE, g.font_ui);
+    g.arm = mk(h, "BUTTON", "ARM", BS_OWNERDRAW, X, 582, 300, 46, ID_ARM, g.f_big);
+    g.panic = mk(h, "BUTTON", "PANIC", BS_OWNERDRAW, X + 316, 582, 176, 46, ID_PANIC, g.f_big);
 
-    g.hotkeys = mk(h, "STATIC", "", SS_LEFT, 16, 514, 492, 18, ID_HOTKEYS, g.font_ui);
+    HWND btns[] = {g.clear, g.save, g.arm, g.panic, g.cb_kbd, g.cb_mouse, g.cb_hist};
+    for (size_t i = 0; i < sizeof btns / sizeof btns[0]; i++)
+        subclass_btn(btns[i]);
 
-    g.arm = mk(h, "BUTTON", "ARM", BS_PUSHBUTTON, 16, 540, 300, 44, ID_ARM, g.font_big);
-    g.panic = mk(h, "BUTTON", "PANIC", BS_PUSHBUTTON, 330, 540, 178, 44, ID_PANIC, g.font_big);
-
-    /* Initialize settings controls from config. */
     char tmp[32];
     snprintf(tmp, sizeof tmp, "%d", g.cfg.port); SetWindowTextA(g.port, tmp);
     snprintf(tmp, sizeof tmp, "%d", g.cfg.send_rate_hz); SetWindowTextA(g.rate, tmp);
     snprintf(tmp, sizeof tmp, "%d", g.cfg.auto_disarm_ms); SetWindowTextA(g.autoed, tmp);
-    SendMessageA(g.cb_kbd, BM_SETCHECK, g.cfg.relay_keyboard ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageA(g.cb_mouse, BM_SETCHECK, g.cfg.relay_mouse ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageA(g.cb_hist, BM_SETCHECK, g.cfg.history_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-
-    char hk[128];
-    snprintf(hk, sizeof hk, "Toggle: %s      Panic: %s", g.cfg.toggle.text, g.cfg.panic.text);
-    SetWindowTextA(g.hotkeys, hk);
 }
 
 static int register_raw_input(HWND hwnd)
@@ -524,11 +649,23 @@ static int register_raw_input(HWND hwnd)
     return RegisterRawInputDevices(rid, 2, sizeof rid[0]) ? 0 : -1;
 }
 
+static void apply_window_chrome(HWND hwnd)
+{
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
+    int corner = DWMWCP_ROUND;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof corner);
+    SetWindowLongPtrA(hwnd, GWL_EXSTYLE, GetWindowLongPtrA(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(hwnd, 0, 244, LWA_ALPHA); /* subtle translucency */
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE:
+        g.hwnd = hwnd;
         create_controls(hwnd);
+        apply_window_chrome(hwnd);
         if (register_raw_input(hwnd) != 0)
             MessageBoxA(hwnd, "Failed to register raw input.", "HIDway", MB_ICONERROR);
         g.net_ok = (hidway_net_open(g.cfg.target, g.cfg.port) == 0);
@@ -538,51 +675,61 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetTimer(hwnd, TIMER_UI, UI_REFRESH_MS, NULL);
         return 0;
 
+    case WM_ERASEBKGND:
+        return 1; /* painted in WM_PAINT, double-buffered */
+    case WM_PAINT:
+        paint(hwnd);
+        return 0;
+
+    case WM_DRAWITEM:
+        draw_button((LPDRAWITEMSTRUCT)lp);
+        return TRUE;
+
+    case WM_CTLCOLORLISTBOX:
+        SetBkColor((HDC)wp, C_FIELD);
+        SetTextColor((HDC)wp, C_DIM);
+        return (LRESULT)g.b_field;
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wp, C_FIELD);
+        SetTextColor((HDC)wp, C_TEXT);
+        return (LRESULT)g.b_field;
+
     case WM_INPUT:
         on_raw_input((HRAWINPUT)lp);
         return 0;
 
     case WM_HOTKEY:
         if (wp == HK_TOGGLE)
-            set_armed(hwnd, !g.armed);
+            set_armed(!g.armed);
         else if (wp == HK_PANIC) {
-            set_armed(hwnd, 0);
+            set_armed(0);
             history_add("PANIC");
         }
         return 0;
 
     case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case ID_ARM: if (HIWORD(wp) == BN_CLICKED) set_armed(hwnd, !g.armed); break;
-        case ID_PANIC: if (HIWORD(wp) == BN_CLICKED) { set_armed(hwnd, 0); history_add("PANIC"); } break;
-        case ID_CLEAR: if (HIWORD(wp) == BN_CLICKED) SendMessageA(g.history, LB_RESETCONTENT, 0, 0); break;
-        case ID_SAVE: if (HIWORD(wp) == BN_CLICKED) apply_settings(hwnd); break;
+        if (HIWORD(wp) == BN_CLICKED) {
+            switch (LOWORD(wp)) {
+            case ID_ARM: set_armed(!g.armed); break;
+            case ID_PANIC: set_armed(0); history_add("PANIC"); break;
+            case ID_CLEAR: SendMessageA(g.history, LB_RESETCONTENT, 0, 0); break;
+            case ID_SAVE: apply_settings(); break;
+            case ID_CB_KBD: g.cfg.relay_keyboard = !g.cfg.relay_keyboard; InvalidateRect(g.cb_kbd, NULL, TRUE); break;
+            case ID_CB_MOUSE: g.cfg.relay_mouse = !g.cfg.relay_mouse; InvalidateRect(g.cb_mouse, NULL, TRUE); break;
+            case ID_CB_HIST: g.cfg.history_enabled = !g.cfg.history_enabled; InvalidateRect(g.cb_hist, NULL, TRUE); break;
+            }
         }
         return 0;
 
     case WM_TIMER:
         if (wp == TIMER_UI)
-            refresh_body();
+            InvalidateRect(hwnd, NULL, FALSE);
         else if (wp == TIMER_NET)
-            net_tick(hwnd);
+            net_tick();
         return 0;
 
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        SetBkColor(dc, C_BG);
-        if ((HWND)lp == g.status)
-            SetTextColor(dc, g.armed ? RGB(60, 210, 120) : C_DIM);
-        else if ((HWND)lp == g.histlabel || (HWND)lp == g.setlabel || (HWND)lp == g.hotkeys)
-            SetTextColor(dc, C_DIM);
-        else
-            SetTextColor(dc, C_TXT);
-        return (LRESULT)g.bg;
-    }
-    case WM_CTLCOLORBTN:
-        return (LRESULT)g.bg;
-
     case WM_CLOSE:
-        set_armed(hwnd, 0);
+        set_armed(0);
         DestroyWindow(hwnd);
         return 0;
 
@@ -608,18 +755,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     g.session_id = ((uint32_t)rand() << 17) ^ ((uint32_t)rand() << 3) ^ GetTickCount();
 
     timeBeginPeriod(1);
-    g.bg = CreateSolidBrush(C_BG);
+    g.b_bg = CreateSolidBrush(C_BG);
+    g.b_card = CreateSolidBrush(C_CARD);
+    g.b_field = CreateSolidBrush(C_FIELD);
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = g.bg;
+    wc.hbrBackground = g.b_bg;
     wc.lpszClassName = "HIDwayClient";
     if (!RegisterClassA(&wc))
         return 1;
 
-    RECT r = {0, 0, 524, 598};
+    RECT r = {0, 0, 524, 642};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     HWND hwnd = CreateWindowA("HIDwayClient", "HIDway", style, CW_USEDEFAULT, CW_USEDEFAULT,
