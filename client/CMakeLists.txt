@@ -1,9 +1,14 @@
 # HIDway client - Windows GUI application.
+if (MSVC)
+    enable_language(RC)
+endif ()
+
 add_executable(hidway-client WIN32
     src/main.c
     src/config.c
     src/net.c
     ${HIDWAY_COMMON}/keymap_sc2hid.c
+    $<$<BOOL:${MSVC}>:app.rc>
 )
 
 target_include_directories(hidway-client PRIVATE src ${HIDWAY_COMMON})

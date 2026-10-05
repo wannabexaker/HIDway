@@ -85,6 +85,8 @@ enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
 #define C_DANGER2  RGB(205, 92, 101)  /* PANIC hover */
 #define C_TEXT     RGB(230, 233, 239)
 #define C_DIM      RGB(139, 147, 161)
+#define C_WHITE    RGB(255, 255, 255) /* button text (stays readable on hover) */
+#define C_HOVERB   RGB(156, 165, 180) /* brighter border to signal hover */
 
 static struct {
     hidway_config_t cfg;
@@ -686,21 +688,21 @@ static void draw_button(LPDRAWITEMSTRUCT d)
             SelectObject(d->hDC, op);
             DeleteObject(p);
         }
-        draw_text(d->hDC, g.f_ui, hot ? C_TEXT : C_DIM, r.left + box + 8, by + 1, label);
+        draw_text(d->hDC, g.f_ui, hot ? C_WHITE : C_TEXT, r.left + box + 8, by + 1, label);
         return;
     }
 
-    COLORREF fill, txt = C_TEXT, border;
+    /* Button text is always near-white so it stays readable on hover; hover is
+     * signalled by a slightly brighter fill and a bright border, never by
+     * changing the text into the fill colour. */
+    COLORREF fill, txt = hot ? C_WHITE : C_TEXT, border = hot ? C_HOVERB : C_BORDER;
     if (id == ID_ARM) {
         fill = g.armed ? C_ACCENT : C_ARM;
         if (hot) fill = g.armed ? C_ACCENT2 : C_ARM2;
-        border = hot ? C_ACCENT2 : C_BORDER;
     } else if (id == ID_PANIC) {
         fill = hot ? C_DANGER2 : C_DANGER;
-        border = fill;
     } else { /* SAVE, CLEAR: subtle */
         fill = hot ? C_FIELD2 : C_FIELD;
-        border = C_BORDER;
     }
     if (pressed) {
         fill = RGB(GetRValue(fill) * 8 / 10, GetGValue(fill) * 8 / 10, GetBValue(fill) * 8 / 10);
@@ -993,11 +995,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     g.b_card = CreateSolidBrush(C_CARD);
     g.b_field = CreateSolidBrush(C_FIELD);
 
+    HICON appicon = LoadIconA(inst, MAKEINTRESOURCEA(1));
+
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = g.b_bg;
+    wc.hIcon = appicon;
     wc.lpszClassName = "HIDwayClient";
     if (!RegisterClassA(&wc))
         return 1;
@@ -1011,6 +1016,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                               r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!hwnd)
         return 1;
+
+    SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)appicon);
+    SendMessageA(hwnd, WM_SETICON, ICON_SMALL,
+                 (LPARAM)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
 
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
