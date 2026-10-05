@@ -20,6 +20,7 @@ typedef struct {
     int history_enabled;    /* record recent-input history in the UI */
     hidway_hotkey_t toggle; /* arm/disarm hotkey */
     hidway_hotkey_t panic;  /* release everything + disarm */
+    int window_x, window_y; /* last window position; INT_MIN = unset */
 } hidway_config_t;
 
 /* Load from `path`. Missing file/keys keep defaults; always fully populated.

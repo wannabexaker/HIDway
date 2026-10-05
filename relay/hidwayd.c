@@ -229,7 +229,20 @@ int main(int argc, char **argv)
                 if (errno != EINTR) perror("recvfrom");
             } else if (!allow_addr || from.sin_addr.s_addr == allow_in.s_addr) {
                 hidway_input_pkt_t p;
-                if (hidway_input_decode(buf, (size_t)n, &p)) {
+                if (hidway_input_decode(buf, (size_t)n, &p) && p.type == HIDWAY_MSG_PROBE) {
+                    /* Reachability ping: reply, but do not touch link state,
+                     * the latest input, the serial link or the counters. */
+                    hidway_status_pkt_t st = {0};
+                    st.session_id = p.session_id;
+                    st.seq = last_seq;
+                    st.client_time_us = p.client_time_us;
+                    st.frames_ok = frames_ok;
+                    st.seq_gaps = seq_gaps;
+                    st.flags = (serial_fd >= 0) ? 0x0002 : 0;
+                    uint8_t sb[HIDWAY_STATUS_PKT_LEN];
+                    size_t sl = hidway_status_encode(sb, &st);
+                    sendto(fd, sb, sl, 0, (struct sockaddr *)&from, fromlen);
+                } else if (hidway_input_decode(buf, (size_t)n, &p)) {
                     if (!have_session || p.session_id != session) {
                         session = p.session_id;
                         have_session = true;

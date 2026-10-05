@@ -27,6 +27,8 @@
 enum {
     HIDWAY_MSG_STATE = 1,   /* client -> relay: full keyboard+mouse state */
     HIDWAY_MSG_RELEASE = 2, /* client -> relay: release everything now */
+    HIDWAY_MSG_PROBE = 3,   /* client -> relay: reachability ping; NOT forwarded
+                               to the Pico and does not affect the link state */
     HIDWAY_MSG_STATUS = 0x81 /* relay -> client: counters + RTT echo */
 };
 
@@ -110,7 +112,7 @@ static inline bool hidway_input_decode(const uint8_t *in, size_t len, hidway_inp
     if (len != HIDWAY_INPUT_PKT_LEN || in[0] != HIDWAY_PROTO_MAGIC || in[1] != HIDWAY_PROTO_VER)
         return false;
     uint8_t type = in[2];
-    if (type != HIDWAY_MSG_STATE && type != HIDWAY_MSG_RELEASE)
+    if (type != HIDWAY_MSG_STATE && type != HIDWAY_MSG_RELEASE && type != HIDWAY_MSG_PROBE)
         return false;
 
     size_t i = 2;

@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,7 @@ static void set_defaults(hidway_config_t *cfg)
     cfg->history_enabled = 1;
     hidway_hotkey_parse("ctrl+shift+f12", &cfg->toggle);
     hidway_hotkey_parse("ctrl+alt+shift+end", &cfg->panic);
+    cfg->window_x = cfg->window_y = INT_MIN;
 }
 
 static int clampi(int v, int lo, int hi)
@@ -188,6 +190,10 @@ int hidway_config_load(const char *path, hidway_config_t *cfg)
             hidway_hotkey_parse(val, &cfg->toggle);
         } else if (!strcmp(key, "panic_hotkey")) {
             hidway_hotkey_parse(val, &cfg->panic);
+        } else if (!strcmp(key, "window_x")) {
+            cfg->window_x = (int)strtol(val, NULL, 10);
+        } else if (!strcmp(key, "window_y")) {
+            cfg->window_y = (int)strtol(val, NULL, 10);
         }
     }
     fclose(f);
@@ -208,7 +214,11 @@ int hidway_config_save(const char *path, const hidway_config_t *cfg)
     fprintf(f, "relay_mouse = %d\n", cfg->relay_mouse);
     fprintf(f, "history_enabled = %d\n\n", cfg->history_enabled);
     fprintf(f, "toggle_hotkey = %s\n", cfg->toggle.text);
-    fprintf(f, "panic_hotkey = %s\n", cfg->panic.text);
+    fprintf(f, "panic_hotkey = %s\n\n", cfg->panic.text);
+    if (cfg->window_x != INT_MIN && cfg->window_y != INT_MIN) {
+        fprintf(f, "window_x = %d\n", cfg->window_x);
+        fprintf(f, "window_y = %d\n", cfg->window_y);
+    }
     fclose(f);
     return 1;
 }

@@ -21,8 +21,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <timeapi.h>
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,14 +51,21 @@
 
 #define HK_TOGGLE 1
 #define HK_PANIC  2
-#define TIMER_UI  1
-#define TIMER_NET 2
+#define TIMER_UI    1
+#define TIMER_NET   2
+#define TIMER_PROBE 3
+#define TIMER_SAVED 4
 #define UI_REFRESH_MS 50
+#define PROBE_MS      400
+#define LINK_RECENT_US 900000u
 #define HISTORY_MAX 60
+
+#define WM_TRAYICON (WM_APP + 1)
 
 enum {
     ID_HISTORY = 1001, ID_CLEAR, ID_TARGET, ID_PORT, ID_RATE, ID_AUTO,
-    ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_SAVE, ID_ARM, ID_PANIC
+    ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_SAVE, ID_ARM, ID_PANIC,
+    IDM_ARM, IDM_PANIC, IDM_SHOW, IDM_QUIT
 };
 
 enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
@@ -101,13 +110,20 @@ static struct {
     uint16_t pi_gaps;
     uint16_t pi_flags;
     int status_seen;
+    int ever_status;
     uint32_t last_status_us;
     uint32_t armed_at_ms;
+    int prev_link_up;
+    int toggle_hk_ok;
 
     HWND hwnd;
     HWND history, clear, target, port, rate, autoed, cb_kbd, cb_mouse, cb_hist, save, arm, panic;
     HFONT f_big, f_mono, f_ui, f_title;
     HBRUSH b_bg, b_card, b_field;
+    NOTIFYICONDATAA nid;
+    int tray_shown;
+    HICON ic_grey, ic_green, ic_red;
+    int cur_icon; /* 0 grey, 1 green, 2 red */
 } g;
 
 /* ---------------------------------------------------------------- helpers */
@@ -180,6 +196,7 @@ static void net_drain_status(void)
         if (!hidway_status_decode(buf, (size_t)n, &s) || s.session_id != g.session_id)
             continue;
         g.status_seen = 1;
+        g.ever_status = 1;
         g.last_status_us = hidway_now_us();
         g.pi_frames_ok = s.frames_ok;
         g.pi_gaps = s.seq_gaps;
@@ -209,6 +226,154 @@ static void net_tick(void)
         set_armed(0);
         history_add("auto-disarmed (link lost)");
     }
+}
+
+static int link_recent(void)
+{
+    return g.ever_status && (hidway_now_us() - g.last_status_us) < LINK_RECENT_US;
+}
+
+static void net_probe(void)
+{
+    if (g.net_ok)
+        net_send_state(HIDWAY_MSG_PROBE);
+    net_drain_status();
+}
+
+/* ------------------------------------------------------------------ tray */
+
+static HICON make_dot_icon(COLORREF c)
+{
+    const int S = 32;
+    HDC sdc = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(sdc);
+    HBITMAP color = CreateCompatibleBitmap(sdc, S, S);
+    HBITMAP mask = CreateBitmap(S, S, 1, 1, NULL);
+    RECT full = {0, 0, S, S};
+
+    HGDIOBJ ob = SelectObject(dc, color);
+    HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    FillRect(dc, &full, black);
+    HBRUSH fill = CreateSolidBrush(c);
+    HPEN pen = CreatePen(PS_SOLID, 1, c);
+    HGDIOBJ of = SelectObject(dc, fill), op = SelectObject(dc, pen);
+    Ellipse(dc, 3, 3, S - 3, S - 3);
+    SelectObject(dc, of);
+    SelectObject(dc, op);
+    DeleteObject(fill);
+    DeleteObject(pen);
+
+    SelectObject(dc, mask);
+    HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    FillRect(dc, &full, white);                 /* 1 = transparent */
+    HGDIOBJ obr = SelectObject(dc, black);
+    Ellipse(dc, 3, 3, S - 3, S - 3);            /* 0 = opaque dot */
+    SelectObject(dc, obr);
+
+    SelectObject(dc, ob);
+    DeleteDC(dc);
+    ReleaseDC(NULL, sdc);
+
+    ICONINFO ii = {TRUE, 0, 0, mask, color};
+    HICON icon = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return icon;
+}
+
+static void tray_update(void)
+{
+    int want;
+    if (g.armed)
+        want = link_recent() ? 1 : 2; /* green healthy, red stale */
+    else
+        want = 0; /* grey idle */
+
+    char tip[128];
+    if (g.armed)
+        snprintf(tip, sizeof tip, "HIDway - ARMED  (RTT %d ms)", g.rtt_ms);
+    else if (link_recent())
+        snprintf(tip, sizeof tip, "HIDway - disarmed, relay reachable (%d ms)", g.rtt_ms);
+    else
+        snprintf(tip, sizeof tip, "HIDway - disarmed");
+
+    g.nid.uFlags = NIF_TIP;
+    strncpy(g.nid.szTip, tip, sizeof g.nid.szTip - 1);
+    g.nid.szTip[sizeof g.nid.szTip - 1] = 0;
+    if (want != g.cur_icon) {
+        g.cur_icon = want;
+        g.nid.hIcon = want == 1 ? g.ic_green : want == 2 ? g.ic_red : g.ic_grey;
+        g.nid.uFlags |= NIF_ICON;
+    }
+    if (g.tray_shown)
+        Shell_NotifyIconA(NIM_MODIFY, &g.nid);
+}
+
+static void tray_balloon(const char *title, const char *text)
+{
+    NOTIFYICONDATAA b = g.nid;
+    b.uFlags = NIF_INFO;
+    b.dwInfoFlags = NIIF_WARNING;
+    strncpy(b.szInfoTitle, title, sizeof b.szInfoTitle - 1);
+    strncpy(b.szInfo, text, sizeof b.szInfo - 1);
+    Shell_NotifyIconA(NIM_MODIFY, &b);
+}
+
+static void tray_init(HWND hwnd)
+{
+    g.ic_grey = make_dot_icon(RGB(120, 128, 140));
+    g.ic_green = make_dot_icon(RGB(74, 222, 128));
+    g.ic_red = make_dot_icon(RGB(224, 86, 92));
+
+    memset(&g.nid, 0, sizeof g.nid);
+    g.nid.cbSize = sizeof g.nid;
+    g.nid.hWnd = hwnd;
+    g.nid.uID = 1;
+    g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g.nid.uCallbackMessage = WM_TRAYICON;
+    g.nid.hIcon = g.ic_grey;
+    g.cur_icon = 0;
+    strcpy(g.nid.szTip, "HIDway - disarmed");
+    g.tray_shown = Shell_NotifyIconA(NIM_ADD, &g.nid);
+}
+
+static void tray_destroy(void)
+{
+    if (g.tray_shown)
+        Shell_NotifyIconA(NIM_DELETE, &g.nid);
+    if (g.ic_grey) DestroyIcon(g.ic_grey);
+    if (g.ic_green) DestroyIcon(g.ic_green);
+    if (g.ic_red) DestroyIcon(g.ic_red);
+}
+
+static void show_main_window(int show)
+{
+    if (show) {
+        ShowWindow(g.hwnd, SW_SHOW);
+        ShowWindow(g.hwnd, SW_RESTORE);
+        SetForegroundWindow(g.hwnd);
+    } else {
+        ShowWindow(g.hwnd, SW_HIDE);
+    }
+}
+
+static void monitor(void)
+{
+    if (!g.armed)
+        net_probe();
+    else
+        net_drain_status();
+
+    int up = g.armed && link_recent();
+    if (g.prev_link_up && !up && g.armed) {
+        FLASHWINFO fw = {sizeof fw, g.hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 3, 0};
+        FlashWindowEx(&fw);
+        tray_balloon("HIDway", "Link lost - input released on the target.");
+    }
+    g.prev_link_up = up;
+
+    tray_update();
+    invalidate_readouts(g.hwnd);
 }
 
 /* ----------------------------------------------------------- input state */
@@ -407,7 +572,12 @@ static void paint(HWND hwnd)
         snprintf(line1, sizeof line1, "socket error");
         snprintf(line2, sizeof line2, "check Target in settings");
     } else if (!g.armed) {
-        snprintf(line1, sizeof line1, "idle - not sending");
+        if (link_recent())
+            snprintf(line1, sizeof line1, "relay reachable   %d ms", g.rtt_ms);
+        else if (g.ever_status)
+            snprintf(line1, sizeof line1, "relay unreachable");
+        else
+            snprintf(line1, sizeof line1, "probing relay...");
         snprintf(line2, sizeof line2, "target  %s:%d", g.cfg.target, g.cfg.port);
     } else if (!g.status_seen) {
         unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
@@ -477,9 +647,12 @@ static void paint(HWND hwnd)
     draw_text(dc, g.f_ui, C_DIM, X + 300, sy + 40, "Port");
     draw_text(dc, g.f_ui, C_DIM, X + 16, sy + 74, "Rate Hz");
     draw_text(dc, g.f_ui, C_DIM, X + 150, sy + 74, "Auto-disarm ms");
-    char hk[160];
-    snprintf(hk, sizeof hk, "toggle  %s        panic  %s", g.cfg.toggle.text, g.cfg.panic.text);
-    draw_text(dc, g.f_mono, C_DIM, X + 16, sy + 118, hk);
+    char hk[192];
+    if (g.toggle_hk_ok)
+        snprintf(hk, sizeof hk, "toggle  %s        panic  %s", g.cfg.toggle.text, g.cfg.panic.text);
+    else
+        snprintf(hk, sizeof hk, "toggle %s IN USE - rebind toggle_hotkey in hidway.ini", g.cfg.toggle.text);
+    draw_text(dc, g.f_mono, g.toggle_hk_ok ? C_DIM : C_DANGER2, X + 16, sy + 118, hk);
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, obmp);
@@ -677,10 +850,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (register_raw_input(hwnd) != 0)
             MessageBoxA(hwnd, "Failed to register raw input.", "HIDway", MB_ICONERROR);
         g.net_ok = (hidway_net_open(g.cfg.target, g.cfg.port) == 0);
-        RegisterHotKey(hwnd, HK_TOGGLE, g.cfg.toggle.mods | MOD_NOREPEAT, g.cfg.toggle.vk);
+        g.toggle_hk_ok = RegisterHotKey(hwnd, HK_TOGGLE, g.cfg.toggle.mods | MOD_NOREPEAT, g.cfg.toggle.vk) ? 1 : 0;
         if (g.cfg.panic.vk)
             RegisterHotKey(hwnd, HK_PANIC, g.cfg.panic.mods | MOD_NOREPEAT, g.cfg.panic.vk);
+        tray_init(hwnd);
         SetTimer(hwnd, TIMER_UI, UI_REFRESH_MS, NULL);
+        SetTimer(hwnd, TIMER_PROBE, PROBE_MS, NULL);
         return 0;
 
     case WM_ERASEBKGND:
@@ -706,6 +881,30 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         on_raw_input((HRAWINPUT)lp);
         return 0;
 
+    case WM_TRAYICON:
+        if (lp == WM_LBUTTONDBLCLK) {
+            show_main_window(1);
+        } else if (lp == WM_RBUTTONUP) {
+            HMENU m = CreatePopupMenu();
+            AppendMenuA(m, MF_STRING, IDM_ARM, g.armed ? "Disarm" : "Arm");
+            AppendMenuA(m, MF_STRING, IDM_PANIC, "Panic (release all)");
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(m, MF_STRING, IDM_SHOW, IsWindowVisible(hwnd) ? "Hide window" : "Show window");
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(m, MF_STRING, IDM_QUIT, "Quit");
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd); /* so the menu dismisses on click-away */
+            TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED)
+            show_main_window(0); /* minimize to tray */
+        return 0;
+
     case WM_HOTKEY:
         if (wp == HK_TOGGLE)
             set_armed(!g.armed);
@@ -716,12 +915,23 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDM_ARM: set_armed(!g.armed); return 0;
+        case IDM_PANIC: set_armed(0); history_add("PANIC"); return 0;
+        case IDM_SHOW: show_main_window(!IsWindowVisible(hwnd)); return 0;
+        case IDM_QUIT: DestroyWindow(hwnd); return 0;
+        }
         if (HIWORD(wp) == BN_CLICKED) {
             switch (LOWORD(wp)) {
             case ID_ARM: set_armed(!g.armed); break;
             case ID_PANIC: set_armed(0); history_add("PANIC"); break;
             case ID_CLEAR: SendMessageA(g.history, LB_RESETCONTENT, 0, 0); break;
-            case ID_SAVE: apply_settings(); break;
+            case ID_SAVE:
+                apply_settings();
+                SetWindowTextA(g.save, "Saved");
+                InvalidateRect(g.save, NULL, TRUE);
+                SetTimer(hwnd, TIMER_SAVED, 1200, NULL);
+                break;
             case ID_CB_KBD: g.cfg.relay_keyboard = !g.cfg.relay_keyboard; InvalidateRect(g.cb_kbd, NULL, TRUE); break;
             case ID_CB_MOUSE: g.cfg.relay_mouse = !g.cfg.relay_mouse; InvalidateRect(g.cb_mouse, NULL, TRUE); break;
             case ID_CB_HIST: g.cfg.history_enabled = !g.cfg.history_enabled; InvalidateRect(g.cb_hist, NULL, TRUE); break;
@@ -734,6 +944,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             invalidate_readouts(hwnd);
         else if (wp == TIMER_NET)
             net_tick();
+        else if (wp == TIMER_PROBE)
+            monitor();
+        else if (wp == TIMER_SAVED) {
+            KillTimer(hwnd, TIMER_SAVED);
+            SetWindowTextA(g.save, "Save");
+            InvalidateRect(g.save, NULL, TRUE);
+        }
         return 0;
 
     case WM_CLOSE:
@@ -741,13 +958,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         return 0;
 
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        WINDOWPLACEMENT wp2 = {sizeof wp2};
+        if (GetWindowPlacement(hwnd, &wp2)) {
+            g.cfg.window_x = wp2.rcNormalPosition.left;
+            g.cfg.window_y = wp2.rcNormalPosition.top;
+            hidway_config_save("hidway.ini", &g.cfg);
+        }
+        tray_destroy();
         KillTimer(hwnd, TIMER_UI);
+        KillTimer(hwnd, TIMER_PROBE);
         UnregisterHotKey(hwnd, HK_TOGGLE);
         UnregisterHotKey(hwnd, HK_PANIC);
         hidway_net_close();
         PostQuitMessage(0);
         return 0;
+    }
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
@@ -779,7 +1005,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     RECT r = {0, 0, 524, 642};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
-    HWND hwnd = CreateWindowA("HIDwayClient", "HIDway", style, CW_USEDEFAULT, CW_USEDEFAULT,
+    int wx = g.cfg.window_x != INT_MIN ? g.cfg.window_x : CW_USEDEFAULT;
+    int wy = g.cfg.window_y != INT_MIN ? g.cfg.window_y : CW_USEDEFAULT;
+    HWND hwnd = CreateWindowA("HIDwayClient", "HIDway", style, wx, wy,
                               r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!hwnd)
         return 1;

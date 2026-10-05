@@ -15,4 +15,4 @@ if (MSVC)
     target_compile_definitions(hidway-client PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif ()
 
-target_link_libraries(hidway-client PRIVATE user32 gdi32 ws2_32 winmm)
+target_link_libraries(hidway-client PRIVATE user32 gdi32 ws2_32 winmm dwmapi shell32)
