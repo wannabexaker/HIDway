@@ -61,18 +61,21 @@ enum {
 
 enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
 
-/* ---- palette (ui-ux-pro-max: dark developer control panel) -------------- */
-#define C_BG      RGB(15, 23, 42)    /* #0F172A */
-#define C_CARD    RGB(30, 41, 59)    /* #1E293B */
-#define C_FIELD   RGB(36, 49, 69)    /* inputs */
-#define C_BORDER  RGB(51, 65, 85)    /* #334155 */
-#define C_ACCENT  RGB(34, 197, 94)   /* #22C55E */
-#define C_ACCENT2 RGB(52, 211, 120)  /* hover */
-#define C_AMBER   RGB(245, 158, 11)
-#define C_DANGER  RGB(239, 68, 68)
-#define C_DANGER2 RGB(248, 113, 113)
-#define C_TEXT    RGB(248, 250, 252)  /* #F8FAFC */
-#define C_DIM     RGB(148, 163, 184)  /* #94A3B8 */
+/* ---- palette: dark monochrome "mouse grey" control panel ---------------- */
+#define C_BG       RGB(21, 24, 29)    /* window background */
+#define C_CARD     RGB(30, 34, 42)    /* card panels */
+#define C_FIELD    RGB(39, 44, 53)    /* inputs / controls */
+#define C_FIELD2   RGB(48, 54, 64)    /* input hover */
+#define C_BORDER   RGB(57, 64, 76)    /* card / control borders */
+#define C_ACCENT   RGB(107, 114, 128) /* mouse grey - primary */
+#define C_ACCENT2  RGB(132, 140, 152) /* hover */
+#define C_ARM      RGB(82, 90, 103)   /* ARM button */
+#define C_ARM2     RGB(104, 113, 128) /* ARM hover */
+#define C_LIVE     RGB(74, 222, 128)  /* tiny "live" indicator only */
+#define C_DANGER   RGB(176, 74, 82)   /* PANIC (muted red) */
+#define C_DANGER2  RGB(205, 92, 101)  /* PANIC hover */
+#define C_TEXT     RGB(230, 233, 239)
+#define C_DIM      RGB(139, 147, 161)
 
 static struct {
     hidway_config_t cfg;
@@ -188,6 +191,7 @@ static void net_drain_status(void)
 }
 
 static void set_armed(int on);
+static void invalidate_readouts(HWND hwnd);
 
 static void net_tick(void)
 {
@@ -244,7 +248,7 @@ static void set_armed(int on)
         g.pps = 0;
     }
     InvalidateRect(g.arm, NULL, TRUE);
-    InvalidateRect(g.hwnd, NULL, FALSE);
+    invalidate_readouts(g.hwnd);
 }
 
 static const struct { uint8_t bit; const char *name; } MODS[] = {
@@ -385,41 +389,40 @@ static void paint(HWND hwnd)
 
     /* Header card: status pill + health readout. */
     fill_round(dc, X, 14, X + W, 110, 12, C_CARD, C_BORDER);
-    COLORREF pill = g.armed ? C_ACCENT : C_BORDER;
-    fill_round(dc, X + 16, 28, X + 16 + 168, 64, 16, pill, pill);
-    /* status dot */
-    HBRUSH dot = CreateSolidBrush(g.armed ? RGB(12, 40, 22) : C_DIM);
-    HGDIOBJ od = SelectObject(dc, dot);
-    HPEN np = CreatePen(PS_SOLID, 1, g.armed ? RGB(12, 40, 22) : C_DIM);
-    HGDIOBJ opn = SelectObject(dc, np);
-    Ellipse(dc, X + 30, 40, X + 42, 52);
+    COLORREF pill = g.armed ? C_ACCENT : C_FIELD;
+    fill_round(dc, X + 16, 30, X + 16 + 172, 66, 15, pill, g.armed ? C_ACCENT2 : C_BORDER);
+    /* small status indicator: green when live, grey when idle */
+    HBRUSH dot = CreateSolidBrush(g.armed ? C_LIVE : C_DIM);
+    HPEN np = CreatePen(PS_SOLID, 1, g.armed ? C_LIVE : C_DIM);
+    HGDIOBJ od = SelectObject(dc, dot), opn = SelectObject(dc, np);
+    Ellipse(dc, X + 32, 42, X + 44, 54);
     SelectObject(dc, od);
     SelectObject(dc, opn);
     DeleteObject(dot);
     DeleteObject(np);
-    draw_text(dc, g.f_big, g.armed ? RGB(8, 32, 18) : C_TEXT, X + 52, 33, g.armed ? "ARMED" : "DISARMED");
+    draw_text(dc, g.f_big, g.armed ? C_TEXT : C_DIM, X + 54, 36, g.armed ? "ARMED" : "DISARMED");
 
     char line1[256] = "", line2[256] = "";
     if (!g.net_ok) {
-        snprintf(line1, sizeof line1, "socket error - check Target in settings");
+        snprintf(line1, sizeof line1, "socket error");
+        snprintf(line2, sizeof line2, "check Target in settings");
     } else if (!g.armed) {
         snprintf(line1, sizeof line1, "idle - not sending");
         snprintf(line2, sizeof line2, "target  %s:%d", g.cfg.target, g.cfg.port);
     } else if (!g.status_seen) {
-        snprintf(line1, sizeof line1, "sending %u/s   waiting for relay reply...", g.pps);
         unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
-        snprintf(line2, sizeof line2, "armed  %u:%02u", s / 60, s % 60);
+        snprintf(line1, sizeof line1, "sending %u/s", g.pps);
+        snprintf(line2, sizeof line2, "waiting for relay...   armed %u:%02u", s / 60, s % 60);
     } else {
         double tot = (double)g.pi_frames_ok + g.pi_gaps;
         double loss = tot > 0 ? 100.0 * g.pi_gaps / tot : 0.0;
         unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
-        snprintf(line1, sizeof line1, "RTT %d ms    loss %.1f%%    %u pkt/s", g.rtt_ms, loss, g.pps);
-        snprintf(line2, sizeof line2, "relay serial %s    Pi ok=%u gaps=%u    armed %u:%02u",
+        snprintf(line1, sizeof line1, "RTT %d ms   loss %.1f%%   %u/s", g.rtt_ms, loss, g.pps);
+        snprintf(line2, sizeof line2, "serial %s  ok=%u gaps=%u  armed %u:%02u",
                  (g.pi_flags & 0x0002) ? "open" : "none", g.pi_frames_ok, g.pi_gaps, s / 60, s % 60);
     }
-    draw_text(dc, g.f_mono, g.armed ? C_ACCENT2 : C_DIM, X + 200, 30, line1);
-    draw_text(dc, g.f_mono, C_DIM, X + 200, 50, line2);
-    draw_text(dc, g.f_mono, C_TEXT, X + 16, 76, line1[0] && !g.armed ? line2 : "");
+    draw_text(dc, g.f_mono, C_TEXT, X + 206, 36, line1);
+    draw_text(dc, g.f_mono, C_DIM, X + 206, 58, line2);
 
     /* Live card. */
     int ly = 120;
@@ -500,9 +503,9 @@ static void draw_button(LPDRAWITEMSTRUCT d)
         GetWindowTextA(d->hwndItem, label, sizeof label);
         int box = 18, by = r.top + (r.bottom - r.top - box) / 2;
         fill_round(d->hDC, r.left, by, r.left + box, by + box, 5,
-                   checked ? C_ACCENT : C_FIELD, checked ? C_ACCENT : C_BORDER);
+                   checked ? C_ACCENT : C_FIELD, checked ? C_ACCENT2 : C_BORDER);
         if (checked) {
-            HPEN p = CreatePen(PS_SOLID, 2, RGB(8, 32, 18));
+            HPEN p = CreatePen(PS_SOLID, 2, C_TEXT);
             HGDIOBJ op = SelectObject(d->hDC, p);
             MoveToEx(d->hDC, r.left + 4, by + 9, NULL);
             LineTo(d->hDC, r.left + 8, by + 13);
@@ -516,17 +519,14 @@ static void draw_button(LPDRAWITEMSTRUCT d)
 
     COLORREF fill, txt = C_TEXT, border;
     if (id == ID_ARM) {
-        fill = g.armed ? C_AMBER : C_ACCENT;
-        if (hot) fill = g.armed ? RGB(251, 180, 50) : C_ACCENT2;
-        txt = RGB(8, 24, 14);
-        border = fill;
+        fill = g.armed ? C_ACCENT : C_ARM;
+        if (hot) fill = g.armed ? C_ACCENT2 : C_ARM2;
+        border = hot ? C_ACCENT2 : C_BORDER;
     } else if (id == ID_PANIC) {
         fill = hot ? C_DANGER2 : C_DANGER;
-        txt = RGB(40, 10, 10);
         border = fill;
     } else { /* SAVE, CLEAR: subtle */
-        fill = hot ? C_BORDER : C_FIELD;
-        txt = C_TEXT;
+        fill = hot ? C_FIELD2 : C_FIELD;
         border = C_BORDER;
     }
     if (pressed) {
@@ -651,12 +651,20 @@ static int register_raw_input(HWND hwnd)
 
 static void apply_window_chrome(HWND hwnd)
 {
+    /* Dark titlebar and rounded corners only - the window itself is opaque. */
     BOOL dark = TRUE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
     int corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof corner);
-    SetWindowLongPtrA(hwnd, GWL_EXSTYLE, GetWindowLongPtrA(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
-    SetLayeredWindowAttributes(hwnd, 0, 244, LWA_ALPHA); /* subtle translucency */
+}
+
+/* Repaint only the live readout band (header + LIVE card). It contains no
+ * child controls, so repainting it on the UI timer never flickers the
+ * list/inputs/buttons below. */
+static void invalidate_readouts(HWND hwnd)
+{
+    RECT rc = {0, 0, 2000, 228};
+    InvalidateRect(hwnd, &rc, FALSE);
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -723,7 +731,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == TIMER_UI)
-            InvalidateRect(hwnd, NULL, FALSE);
+            invalidate_readouts(hwnd);
         else if (wp == TIMER_NET)
             net_tick();
         return 0;
