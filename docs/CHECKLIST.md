@@ -25,6 +25,16 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 - [x] **12. Client UI** — health header (RTT/loss/pps/relay-serial/armed-since),
   recent-input history (memory only), in-app settings + save to hidway.ini,
   panic hotkey + auto-disarm-on-link-loss, always starts disarmed.
+- [x] **12b. Client UX** — tray icon (state colour, tooltip, menu,
+  minimize-to-tray), pre-arm reachability (PROBE), link-loss alert, hotkey
+  conflict warning, app icon, remembered window position.
+- [x] **12c. Client UI rebuild** — per-monitor DPI aware, anti-aliased
+  card/tile/chip design, dark scrollbar, readable hover/focus states,
+  `--preview`/`--shot` for verified screenshots.
+- [!] **12d. Relay redeploy for PROBE** — `hidwayd` with PROBE support is
+  committed but not yet running on the Pi (SSH to the Pi was timing out over
+  the relayed Tailscale path). Until then the disarmed client shows
+  "no reply from relay"; armed mode works.
 
 ## Blocked on hardware / decision
 
