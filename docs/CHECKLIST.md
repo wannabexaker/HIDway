@@ -38,20 +38,22 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   Pi (one `install.sh` run), this and every later relay change deploy
   automatically.
 
-- [x] **16. Relay as a self-updating service** — `hidwayd`: serial reopen
-  with retry (probe unplug/replug), RELEASE on every new serial connection,
+- [x] **16. Relay as a managed service** — `hidwayd`: serial reopen with
+  retry (probe unplug/replug), RELEASE on every new serial connection,
   latest-only serial writes (`TIOCOUTQ`) with partial-write resync, 2000 pps
-  cap, `--version`, `--state-file`. `relay/deploy/`: `install.sh` /
-  `uninstall.sh`, hardened `hidwayd.service`, `hidway-update` + 5-minute timer
-  (build as an unprivileged user, unit tests gate, per-commit releases, atomic
-  switch, deferred while a session is live, auto-rollback on a failed health
-  check, pruning), udev rule `/dev/hidway-serial`, backups under
-  `/var/backups/hidway`. Service files run as root, so they are never changed
-  automatically (`--apply-system`). Docs: `docs/RELAY.md`.
-  Verified in a sandbox: unit tests incl. resync cases (ctest + `make check`),
-  serial reconnect/timeout/shutdown 13/13 (pty), rate cap exact,
-  install/update/rollback/uninstall 35/35 (fake root, local git server,
-  systemctl stand-in), shellcheck clean.
+  cap, `--version`, live `--state-file`; event-driven loop (idle wakeups
+  60 per 3 s -> 0). `relay/deploy/`: `install.sh` / `uninstall.sh`, hardened
+  and resource-bounded `hidwayd.service`; `hidway-update` deploys release
+  tags `vX.Y.Z` only (daily check = one `git ls-remote`; build as an
+  unprivileged user; unit tests gate; per-commit releases; atomic switch;
+  never restarts during a live session; auto-rollback on a failed health
+  check; held releases; pruning); service files only via `--apply-system`;
+  `hidway-status` (OK/WARN/DOWN + exit code) and a status line at SSH login;
+  udev rule `/dev/hidway-serial`; backups under `/var/backups/hidway`.
+  Docs: `docs/RELAY.md`. Verified in a sandbox: unit tests incl. resync cases
+  (ctest + `make check`), serial reconnect/timeout/shutdown 13/13 (pty), rate
+  cap exact, install/release/rollback/status/uninstall 43/43 (fake root,
+  local git server, systemctl stand-in), shellcheck clean.
   *Not yet run on the Pi (needs systemd + udev there).*
 
 ## Blocked on hardware / decision

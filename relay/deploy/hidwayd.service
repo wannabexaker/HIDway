@@ -20,9 +20,13 @@ TimeoutStopSec=5
 RuntimeDirectory=hidway
 RuntimeDirectoryMode=0755
 
-# Low, bounded latency on a shared Pi; hidwayd sleeps in poll() when idle.
+# Low latency on a shared Pi. Bounded: one thread that sleeps in poll() and
+# wakes only for work (no wakeups at all while idle); kernel RT throttling
+# applies. Memory and task limits contain any fault.
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=20
+MemoryMax=32M
+TasksMax=4
 
 # Hardening: no privileges, read-only system, serial devices only.
 NoNewPrivileges=yes

@@ -1,0 +1,6 @@
+#!/bin/sh
+# HIDway: one status line at login (see: hidway-status).
+if [ -x /usr/local/bin/hidway-status ]; then
+    timeout 3 /usr/local/bin/hidway-status --short
+fi
+exit 0

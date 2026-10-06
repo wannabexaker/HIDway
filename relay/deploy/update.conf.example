@@ -5,10 +5,11 @@
 # install.sh fills this in from the checkout it was run from.
 HIDWAY_REPO=<repository-url>
 
-# What to follow:
-#   a branch name (e.g. main)  - every push that touches the relay is deployed
-#   latest-tag                 - only release tags matching v* are deployed
-HIDWAY_REF=main
+# What to deploy:
+#   latest-tag   the newest release tag vX.Y.Z (recommended: deploying is a
+#                deliberate act; pushes to main never reach the Pi)
+#   <branch>     e.g. main - every commit that touches the relay is deployed
+HIDWAY_REF=latest-tag
 
 # Number of built releases kept for rollback (the current and the previous
 # release are always kept).

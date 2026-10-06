@@ -42,11 +42,10 @@
 #endif
 
 #define LINK_TIMEOUT_MS   250
-#define STATS_PERIOD_MS   1000
+#define TICK_MS           1000 /* counters/log while a session is live */
 #define SERIAL_RETRY_MS   1000
 #define RATE_LIMIT_PPS    2000 /* accepted packets per second, RELEASE exempt */
-#define POLL_IDLE_MS      50
-#define POLL_PENDING_MS   1    /* a state is waiting for the tty to drain */
+#define POLL_PENDING_MS   1    /* a frame is waiting for the tty to drain */
 
 #define STATUS_FLAG_SERIAL_OPEN 0x0002
 
@@ -205,10 +204,23 @@ static void serial_send_state(serial_link_t *l, const hidway_input_pkt_t *p)
 
 /* ------------------------------------------------------------ state file */
 
-/* A small key=value file for local tooling (hidway-update, monitoring).
- * Written atomically on every change; removed on exit. */
-static void write_state_file(const char *path, bool link_up, const serial_link_t *l,
-                             bool have_session, uint32_t session)
+/* What the state file publishes for local tooling (hidway-status,
+ * hidway-update, monitoring). */
+typedef struct {
+    bool link_up;
+    bool have_session;
+    uint32_t session;
+    uint32_t frames_ok;
+    uint16_t seq_gaps;
+    uint32_t pps;        /* accepted packets in the last second */
+    uint32_t rate_drops;
+    time_t started;      /* wall clock */
+    time_t last_rx;      /* wall clock of the last accepted packet, 0 = never */
+} relay_view_t;
+
+/* Written atomically (tmp + rename) on every change and once per second while
+ * a session is live; never while idle. Removed on exit. */
+static void write_state_file(const char *path, const relay_view_t *v, const serial_link_t *l)
 {
     if (!path)
         return;
@@ -218,14 +230,38 @@ static void write_state_file(const char *path, bool link_up, const serial_link_t
     FILE *f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "version=%s\npid=%ld\nlink=%s\nserial=%s\n", HIDWAY_VERSION, (long)getpid(),
-            link_up ? "up" : "down", !l->dev ? "none" : l->fd >= 0 ? "open" : "closed");
-    if (have_session)
-        fprintf(f, "session=%08x\n", session);
+    fprintf(f,
+            "version=%s\npid=%ld\nstarted=%lld\nlink=%s\nserial=%s\nserial_dev=%s\n"
+            "last_rx=%lld\npps=%u\nframes=%u\ngaps=%u\nrate_drops=%u\nreplaced=%u\n",
+            HIDWAY_VERSION, (long)getpid(), (long long)v->started, v->link_up ? "up" : "down",
+            !l->dev ? "none" : l->fd >= 0 ? "open" : "closed", l->dev ? l->dev : "",
+            (long long)v->last_rx, v->pps, v->frames_ok, v->seq_gaps, v->rate_drops, l->replaced);
+    if (v->have_session)
+        fprintf(f, "session=%08x\n", v->session);
     if (fclose(f) == 0)
         rename(tmp, path);
     else
         unlink(tmp);
+}
+
+/* Sleep until the next thing that needs doing: a pending serial frame, the
+ * link timeout, the per-second tick of a live session, or the next serial
+ * open attempt. Idle with the serial device open: no wakeups at all. */
+static int poll_timeout(uint64_t t, bool link_up, uint64_t last_pkt_ms, uint64_t next_tick_ms,
+                        const serial_link_t *l)
+{
+    if (l->have_pending)
+        return POLL_PENDING_MS;
+    uint64_t deadline = UINT64_MAX;
+    if (link_up) {
+        uint64_t timeout_at = last_pkt_ms + LINK_TIMEOUT_MS + 1;
+        deadline = timeout_at < next_tick_ms ? timeout_at : next_tick_ms;
+    }
+    if (l->dev && l->fd < 0 && l->next_try_ms < deadline)
+        deadline = l->next_try_ms;
+    if (deadline == UINT64_MAX)
+        return -1;
+    return deadline > t ? (int)(deadline - t) : 0;
 }
 
 /* ------------------------------------------------------------ rate limit */
@@ -353,21 +389,25 @@ int main(int argc, char **argv)
 
     bool link_up = false;
     uint64_t last_pkt_ms = 0;
-    uint64_t next_stats_ms = now_ms() + STATS_PERIOD_MS;
+    uint64_t next_tick_ms = 0; /* per-second tick, only while the link is up */
     uint32_t in_this_sec = 0, in_pps = 0;
     rate_limit_t rate = {.window_ms = now_ms()};
+    time_t started = time(NULL);
 
-    /* Published state; the file is rewritten only when one of these changes. */
+    /* Published state; the file is rewritten when one of these changes. */
     bool pub_link = false, pub_serial = ser.fd >= 0, pub_session = false;
     uint32_t pub_session_id = 0;
-    write_state_file(state_path, link_up, &ser, have_session, session);
+    bool publish = false;
+    relay_view_t initial = {.started = started};
+    write_state_file(state_path, &initial, &ser);
 
     while (running) {
         struct pollfd pfd[2] = {
             {.fd = fd, .events = POLLIN},
             {.fd = ser.fd, .events = 0}, /* POLLHUP/POLLERR: device gone */
         };
-        int pr = poll(pfd, ser.fd >= 0 ? 2 : 1, ser.have_pending ? POLL_PENDING_MS : POLL_IDLE_MS);
+        int pr = poll(pfd, ser.fd >= 0 ? 2 : 1,
+                      poll_timeout(now_ms(), link_up, last_pkt_ms, next_tick_ms, &ser));
         uint64_t t = now_ms();
 
         if (pr > 0 && ser.fd >= 0 && (pfd[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
@@ -424,7 +464,10 @@ int main(int argc, char **argv)
                     frames_ok++;
                     in_this_sec++;
                     latest = p;
-                    link_up = true;
+                    if (!link_up) {
+                        link_up = true;
+                        next_tick_ms = t + TICK_MS;
+                    }
                     last_pkt_ms = t;
 
                     /* Forward the latest full state to the Pico. */
@@ -458,29 +501,44 @@ int main(int argc, char **argv)
         serial_open(&ser, t);
         serial_pump(&ser);
 
-        if (link_up != pub_link || (ser.fd >= 0) != pub_serial || have_session != pub_session ||
-            session != pub_session_id) {
-            pub_link = link_up;
-            pub_serial = ser.fd >= 0;
-            pub_session = have_session;
-            pub_session_id = session;
-            write_state_file(state_path, link_up, &ser, have_session, session);
-        }
-
-        if (t >= next_stats_ms) {
+        if (link_up && t >= next_tick_ms) {
             in_pps = in_this_sec;
             in_this_sec = 0;
-            next_stats_ms += STATS_PERIOD_MS;
-            if (!quiet && have_session) {
+            next_tick_ms = t + TICK_MS;
+            publish = true; /* live counters */
+            if (!quiet) {
                 int nkeys = popcount_bitmap(latest.keys, HIDWAY_KEY_BITMAP_BYTES);
                 fprintf(stderr,
-                        "in=%4u/s ok=%-8u gaps=%-4u link=%s serial=%s replaced=%u ratedrop=%u"
+                        "in=%4u/s ok=%-8u gaps=%-4u serial=%s replaced=%u ratedrop=%u"
                         " | mods=%02x keys=%d btn=%02x x=%ld y=%ld\n",
-                        in_pps, frames_ok, seq_gaps, link_up ? "up" : "DOWN",
+                        in_pps, frames_ok, seq_gaps,
                         !ser.dev ? "none" : ser.fd >= 0 ? "open" : "CLOSED", ser.replaced,
                         rate.drops, latest.mods, nkeys, latest.buttons, (long)latest.x,
                         (long)latest.y);
             }
+        }
+        if (!link_up)
+            in_pps = in_this_sec = 0;
+
+        if (publish || link_up != pub_link || (ser.fd >= 0) != pub_serial ||
+            have_session != pub_session || session != pub_session_id) {
+            pub_link = link_up;
+            pub_serial = ser.fd >= 0;
+            pub_session = have_session;
+            pub_session_id = session;
+            publish = false;
+            relay_view_t v = {
+                .link_up = link_up,
+                .have_session = have_session,
+                .session = session,
+                .frames_ok = frames_ok,
+                .seq_gaps = seq_gaps,
+                .pps = in_pps,
+                .rate_drops = rate.drops,
+                .started = started,
+                .last_rx = have_session ? time(NULL) - (time_t)((t - last_pkt_ms) / 1000) : 0,
+            };
+            write_state_file(state_path, &v, &ser);
         }
     }
 

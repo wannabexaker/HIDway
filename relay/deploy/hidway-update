@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# hidway-update - keep the HIDway relay on this Pi in sync with the repository.
+# hidway-update - deploy HIDway relay releases on this Pi, with rollback.
 #
-#   hidway-update                 update if needed; restart only when idle
-#   hidway-update --now           update and restart even during a live session
-#   hidway-update --check         report whether an update is available
-#   hidway-update --rollback      switch back to the previous release
-#   hidway-update --apply-system  install changed service files (units, udev, updater)
-#   hidway-update --status        show what is installed and running
-#   hidway-update --auto          timer mode: like the default, quiet when idle
+#   hidway-status                 health, session, serial link, updates (no root needed)
+#   hidway-status --short         the same as one line (used at login)
+#   hidway-update                 install the latest release if there is one
+#   hidway-update --now           also restart during a live session; retry a held release
+#   hidway-update --check         report whether a newer release exists (exit 10 if so)
+#   hidway-update --rollback      switch back to the previous release and hold there
+#   hidway-update --apply-system  install changed service files (units, udev, this tool)
+#   hidway-update --auto          timer mode (daily): like the default, quiet when idle
 #
-# Releases: every release is built from a clean checkout by an unprivileged
-# build user, must pass the unit tests, and is installed into its own
-# directory under releases/. "current" is switched atomically, the previous
-# release is kept for an instant rollback, and a release that does not come
-# up healthy is rolled back automatically. A restart while a session is live
-# is deferred: the Pico would release every key, which is safe but not
-# something to do in the middle of a game.
+# Releases: by default the Pi follows release tags (vX.Y.Z), so a deployment
+# is always a deliberate act. A check is one small request (git ls-remote);
+# nothing is fetched or built unless upstream changed. Every release is built
+# from a clean checkout by an unprivileged build user, must pass the unit
+# tests, and is installed into its own directory under releases/. "current"
+# is switched atomically and the previous release is kept. A restart while a
+# session is live is deferred. A release that does not come up healthy is
+# rolled back automatically; a release you roll back from stays held. Neither
+# is retried until a newer release appears or you run --now.
 #
 # System files: the relay binary runs unprivileged and sandboxed, so it is
-# updated automatically. Service files run as root, so changes to them are
+# deployed automatically. Service files run as root, so changes to them are
 # only announced and applied with an explicit --apply-system.
 set -euo pipefail
 umask 022
@@ -31,18 +34,21 @@ CURRENT=$HOME_DIR/current
 PREVIOUS=$HOME_DIR/previous
 SYSTEM_COMMIT=$HOME_DIR/system-commit   # commit of the installed service files
 SYSTEM_PENDING=$HOME_DIR/system-pending # newer service files waiting for --apply-system
+UPSTREAM_SEEN=$HOME_DIR/upstream-seen   # last upstream ref fully handled ("<name> <sha>")
+UPDATE_STATUS=$HOME_DIR/update-status   # outcome of the last check, for hidway-status
 ETC=$ROOT/etc/hidway
 STATE_FILE=$ROOT/run/hidway/state
 LOCK_FILE=$ROOT/run/lock/hidway-update.lock
 SYSTEMCTL=${HIDWAY_SYSTEMCTL:-systemctl}
 SERVICE=hidwayd.service
+TIMER=hidway-update.timer
 HEALTH_TIMEOUT=10
 DEPLOY_FILES=(install.sh hidway-update hidwayd.service hidway-update.service
-    hidway-update.timer 99-hidway.rules)
+    hidway-update.timer 99-hidway.rules 60-hidway)
 
 # Defaults; /etc/hidway/update.conf overrides them.
 HIDWAY_REPO= # empty: keep the checkout's origin
-HIDWAY_REF=main
+HIDWAY_REF=latest-tag
 HIDWAY_KEEP=3
 HIDWAY_BUILD_USER=${HIDWAY_BUILD_USER-hidway-build}
 if [[ -r $ETC/update.conf ]]; then
@@ -51,9 +57,14 @@ if [[ -r $ETC/update.conf ]]; then
 fi
 
 QUIET=0
+RECORD=0 # update mode: outcomes go to $UPDATE_STATUS
 log() { [[ $QUIET == 1 ]] || printf 'hidway-update: %s\n' "$*" >&2; }
 note() { printf 'hidway-update: %s\n' "$*" >&2; } # shown in --auto too (journal)
-die() { printf 'hidway-update: error: %s\n' "$*" >&2; exit 1; }
+die() {
+    printf 'hidway-update: error: %s\n' "$*" >&2
+    [[ $RECORD == 1 ]] && record failed "$*"
+    exit 1
+}
 
 # Run as the unprivileged build user: fetching, compiling and running freshly
 # built code never happen as root.
@@ -67,12 +78,21 @@ as_build() {
 git_src() { as_build git -C "$SRC" "$@"; }
 checkout() { git_src -c advice.detachedHead=false checkout --quiet --force --detach "$1"; }
 
-release_field() { sed -n "s/^$2=//p" "$1/RELEASE" 2>/dev/null | head -n1; }
-state_field() { sed -n "s/^$1=//p" "$STATE_FILE" 2>/dev/null | head -n1; }
+field() { [[ -r $1 ]] && sed -n "/^$2=/{s///p;q}" "$1" || true; } # field <file> <key>
+release_field() { field "$1/RELEASE" "$2"; }
+state_field() { field "$STATE_FILE" "$1"; }
 link_target() { readlink "$1" 2>/dev/null || true; }
 list_releases() { # newest first
-    find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' 2>/dev/null |
+    [[ -d $RELEASES ]] || return 0
+    find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' |
         sort -rn | cut -d' ' -f2-
+}
+held_reason() { # why a release is not deployed automatically, if it is held
+    if [[ -e $1/FAILED ]]; then
+        echo "failed its health check"
+    elif [[ -e $1/ROLLEDBACK ]]; then
+        echo "rolled back"
+    fi
 }
 
 # Point a symlink at a target atomically (rename over the old link).
@@ -84,22 +104,52 @@ set_link() {
 service_active() { "$SYSTEMCTL" is-active --quiet "$SERVICE"; }
 service_enabled() { "$SYSTEMCTL" is-enabled --quiet "$SERVICE" 2>/dev/null; }
 
-# ---------------------------------------------------------------- resolve
+# Outcome of this run, for hidway-status. "run" ties the record to this
+# process so the exit trap can tell whether an outcome was written.
+record() { # record <result> <detail>
+    printf 'checked=%s\nresult=%s\ndetail=%s\nrun=%s\n' "$(date +%s)" "$1" "$2" "$$" \
+        >"$UPDATE_STATUS.new" && mv -f "$UPDATE_STATUS.new" "$UPDATE_STATUS"
+}
+record_checked() { # refresh the time only; the last outcome still stands
+    local result detail
+    result=$(field "$UPDATE_STATUS" result)
+    detail=$(field "$UPDATE_STATUS" detail)
+    record "${result:-up-to-date}" "$detail"
+}
 
-fetch_target() { # prints the commit to deploy
+# ---------------------------------------------------------------- upstream
+
+sync_origin() {
     if [[ -n $HIDWAY_REPO && $HIDWAY_REPO != *'<'* &&
         $(git_src remote get-url origin) != "$HIDWAY_REPO" ]]; then
         git_src remote set-url origin "$HIDWAY_REPO"
     fi
-    git_src fetch --quiet --prune --tags origin
-    local ref
+}
+
+# What upstream offers now, as "<name> <sha>", in a single request. Only
+# plain vX.Y.Z tags count as releases (pre-release tags are ignored).
+upstream() {
+    local out name
     if [[ $HIDWAY_REF == latest-tag ]]; then
-        ref=$(git_src tag --list 'v*' --sort=-v:refname | head -n1)
-        [[ -n $ref ]] || die "no v* release tag found"
+        out=$(git_src ls-remote --tags --refs origin 'refs/tags/v*') ||
+            die "cannot reach the repository"
+        name=$(awk '{sub("^refs/tags/", "", $2); print $2}' <<<"$out" |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+        [[ -n $name ]] || die "no release tag (vX.Y.Z) in the repository yet"
+        awk -v r="refs/tags/$name" '$2 == r { print $1 }' <<<"$out" | sed "s|^|$name |"
     else
-        ref=origin/$HIDWAY_REF
+        out=$(git_src ls-remote --heads origin "refs/heads/$HIDWAY_REF") ||
+            die "cannot reach the repository"
+        [[ -n $out ]] || die "branch '$HIDWAY_REF' not found in the repository"
+        echo "$HIDWAY_REF ${out%%[[:space:]]*}"
     fi
-    git_src rev-parse --verify --quiet "$ref^{commit}" || die "cannot resolve '$HIDWAY_REF'"
+}
+
+fetch_commit() { # fetch_commit <name> -> commit to deploy
+    git_src fetch --quiet --prune --tags origin || die "fetch failed"
+    local ref=refs/tags/$1
+    [[ $HIDWAY_REF == latest-tag ]] || ref=refs/remotes/origin/$1
+    git_src rev-parse --verify --quiet "$ref^{commit}" || die "cannot resolve $1"
 }
 
 # True when <paths> differ between two commits (or the base is unknown).
@@ -112,18 +162,18 @@ changed() { # changed <old> <new> <paths...>
 
 # ---------------------------------------------------------------- build
 
-build_release() { # build_release <commit> -> prints the release dir
-    local commit=$1 short dir tmp version
+build_release() { # build_release <commit> <ref name> -> prints the release dir
+    local commit=$1 name=$2 short dir tmp version
     short=$(git_src rev-parse --short=12 "$commit")
     dir=$RELEASES/$short
     if [[ -f $dir/RELEASE ]]; then
         echo "$dir"
         return
     fi
-    log "building $short"
+    log "building $name ($short)"
     checkout "$commit"
     git_src clean -fdxq
-    as_build make -s -C "$SRC/relay" hidwayd check >&2 || die "build or unit tests failed for $short"
+    as_build make -s -C "$SRC/relay" hidwayd check >&2 || die "build or unit tests failed for $name"
 
     version=$(git_src describe --always --tags "$commit")
     [[ $(as_build "$SRC/relay/hidwayd" --version) == "hidwayd $version" ]] ||
@@ -135,7 +185,7 @@ build_release() { # build_release <commit> -> prints the release dir
     cat >"$tmp/RELEASE" <<EOF
 commit=$commit
 version=$version
-ref=$HIDWAY_REF
+ref=$name
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
     mv -T "$tmp" "$dir"
@@ -221,51 +271,75 @@ check_system_files() { # check_system_files <commit>
 # ---------------------------------------------------------------- commands
 
 cmd_update() { # cmd_update <force>
-    local force=$1 target cur cur_commit dir version
-    target=$(fetch_target)
+    local force=$1 up name target cur cur_commit dir version held
+    sync_origin
+    up=$(upstream)
+    name=${up%% *}
+    if [[ $force != 1 && $up == "$(cat "$UPSTREAM_SEEN" 2>/dev/null || true)" ]]; then
+        log "no upstream change ($name)"
+        record_checked
+        return 0
+    fi
+
+    target=$(fetch_commit "$name")
     cur=$(link_target "$CURRENT")
     cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
 
-    if [[ $target != "$cur_commit" ]] && changed "$cur_commit" "$target" relay common tests; then
-        dir=$(build_release "$target")
+    if [[ $target == "$cur_commit" ]] || ! changed "$cur_commit" "$target" relay common tests; then
+        log "up to date ($(release_field "$cur" version))"
+        record up-to-date "running $(release_field "$cur" version)"
+    else
+        dir=$(build_release "$target" "$name")
         version=$(release_field "$dir" version)
-        if [[ -e $dir/FAILED && $force != 1 ]]; then
-            log "$version failed its health check before; skipping (hidway-update --now retries)"
+        held=$(held_reason "$dir")
+        if [[ -n $held && $force != 1 ]]; then
+            log "$version $held before; not deploying it again (hidway-update --now does)"
+            record held "$version $held; running $(release_field "$cur" version)"
         elif [[ $(state_field link) == up && $force != 1 ]]; then
-            note "$version is ready; waiting for the live session to end (or run: hidway-update --now)"
+            note "$version is ready; it is installed when the live session ends"
+            record ready "$version is ready; installs at the next check after the session ends"
             prune "$dir"
+            check_system_files "$target"
+            return 0 # not "seen": the next check finishes the job
         else
-            rm -f "$dir/FAILED"
+            rm -f "$dir/FAILED" "$dir/ROLLEDBACK"
             activate "$dir"
+            record activated "now running $version"
             prune
         fi
-    else
-        log "up to date ($(release_field "$cur" version))"
     fi
     check_system_files "$target"
+    echo "$up" >"$UPSTREAM_SEEN"
 }
 
 cmd_check() {
-    local target cur cur_commit
-    target=$(fetch_target)
+    local up name target cur cur_commit
+    sync_origin
+    up=$(upstream)
+    name=${up%% *}
+    target=$(fetch_commit "$name")
     cur=$(link_target "$CURRENT")
     cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
     if [[ $target != "$cur_commit" ]] && changed "$cur_commit" "$target" relay common tests; then
         echo "update available: $(git_src describe --always --tags "$target")"
         return 10
     fi
-    echo "up to date"
+    echo "up to date ($name)"
 }
 
 cmd_rollback() {
-    local prev cur version
+    local prev cur version from
     prev=$(link_target "$PREVIOUS")
     cur=$(link_target "$CURRENT")
     [[ -n $prev && -d $prev && $prev != "$cur" ]] || die "no previous release to roll back to"
     version=$(release_field "$prev" version)
+    from=$(release_field "$cur" version)
+    touch "$cur/ROLLEDBACK" # held: not redeployed automatically
+    rm -f "$prev/ROLLEDBACK" "$prev/FAILED"
     set_link "$PREVIOUS" "$cur"
     set_link "$CURRENT" "$prev"
-    note "rolled back to $version"
+    note "rolled back to $version ($from is held until a newer release or --now)"
+    record held "rolled back from $from; running $version"
     if service_active || service_enabled; then
         "$SYSTEMCTL" restart "$SERVICE"
         wait_healthy "$version" || die "hidwayd not healthy after rollback"
@@ -294,51 +368,162 @@ cmd_apply_system() {
     note "service files now match $(release_field "$cur" version)"
 }
 
-cmd_status() {
-    local cur prev d mark
+# ---------------------------------------------------------------- status
+
+when() { [[ ${1:-0} -gt 0 ]] && date -d "@$1" '+%Y-%m-%d %H:%M' || echo never; }
+ago() { # ago <epoch> -> "3h 12m"
+    [[ ${1:-} =~ ^[0-9]+$ ]] || { echo "?"; return; }
+    local s=$(($(date +%s) - $1))
+    if ((s < 60)); then
+        echo "${s}s"
+    elif ((s < 3600)); then
+        echo "$((s / 60))m"
+    elif ((s < 86400)); then
+        echo "$((s / 3600))h $((s % 3600 / 60))m"
+    else
+        echo "$((s / 86400))d $((s % 86400 / 3600))h"
+    fi
+}
+
+next_check() {
+    local t
+    "$SYSTEMCTL" is-enabled --quiet "$TIMER" 2>/dev/null || { echo off; return; }
+    t=$("$SYSTEMCTL" show -p NextElapseUSecRealtime --value --timestamp=unix "$TIMER" 2>/dev/null || true)
+    [[ $t == @* ]] && when "${t#@}" || echo scheduled
+}
+
+# Health, one level: 0 OK, 1 WARN, 2 DOWN; with the reasons.
+cmd_status() { # cmd_status <short>
+    local short=$1 level=0 reasons=() active cur prev version link serial dev last_rx
+    local result detail checked following d mark next held
     cur=$(link_target "$CURRENT")
     prev=$(link_target "$PREVIOUS")
-    printf 'service   : %s' "$("$SYSTEMCTL" is-active "$SERVICE" 2>/dev/null || true)"
-    if [[ -r $STATE_FILE ]]; then
-        printf ' | running %s | link %s | serial %s' \
-            "$(state_field version)" "$(state_field link)" "$(state_field serial)"
+    active=$("$SYSTEMCTL" is-active "$SERVICE" 2>/dev/null || true)
+    version=$(state_field version)
+    link=$(state_field link)
+    serial=$(state_field serial)
+    dev=$(state_field serial_dev)
+    last_rx=$(state_field last_rx)
+    result=$(field "$UPDATE_STATUS" result)
+    detail=$(field "$UPDATE_STATUS" detail)
+    checked=$(field "$UPDATE_STATUS" checked)
+    following=$([[ $HIDWAY_REF == latest-tag ]] && echo "release tags" || echo "branch $HIDWAY_REF")
+    next=$(next_check)
+
+    if [[ $active != active ]]; then
+        level=2
+        reasons+=("relay not running (${active:-unknown})")
+    elif [[ $serial == closed ]]; then
+        level=1
+        reasons+=("serial device missing")
     fi
-    printf '\nfollowing : %s (%s)\n' "$HIDWAY_REF" "$HIDWAY_REPO"
+    if [[ $result == failed ]]; then
+        ((level < 1)) && level=1
+        reasons+=("last update check failed")
+    fi
     if [[ -s $SYSTEM_PENDING ]]; then
-        printf 'system    : newer service files available -> sudo hidway-update --apply-system\n'
-    else
-        printf 'system    : service files up to date\n'
+        ((level < 1)) && level=1
+        reasons+=("service files to apply")
     fi
-    printf 'releases  : (* current, < previous, ! failed health check)\n'
+    d=$(list_releases | sed -n 1p)
+    if [[ -n $d && $d != "$cur" && -e $d/FAILED ]]; then
+        ((level < 1)) && level=1
+        reasons+=("$(release_field "$d" version) failed its health check")
+    fi
+    local word=(OK WARN DOWN)
+    local summary=${word[$level]}
+    if ((${#reasons[@]})); then
+        summary+=": $(printf '%s, ' "${reasons[@]}")"
+        summary=${summary%, }
+    fi
+
+    if [[ $short == 1 ]]; then
+        local s="HIDway $summary"
+        [[ $active == active ]] && s+=" | ${version:-?} | $([[ $link == up ]] && echo live || echo idle) | serial ${serial:-?}"
+        s+=" | updates: ${result:-not checked yet}"
+        echo "$s"
+        return "$level"
+    fi
+
+    printf 'HIDway relay: %s\n\n' "$summary"
+    if [[ $active == active ]]; then
+        printf '  relay     running %s, up %s\n' "${version:-?}" "$(ago "$(state_field started)")"
+        if [[ $link == up ]]; then
+            printf '  session   live: %s pkt/s, session %s, %s gaps, %s rate-limited\n' \
+                "$(state_field pps)" "$(state_field session)" "$(state_field gaps)" "$(state_field rate_drops)"
+        else
+            printf '  session   idle (last input: %s)\n' "$(when "$last_rx")"
+        fi
+        case $serial in
+        open) printf '  serial    %s connected\n' "$dev" ;;
+        closed) printf '  serial    %s not connected (retrying every second)\n' "$dev" ;;
+        *) printf '  serial    none configured\n' ;;
+        esac
+    else
+        printf '  relay     %s  (journalctl -u hidwayd -n 50)\n' "${active:-unknown}"
+    fi
+    if [[ -n $checked ]]; then
+        printf '  updates   following %s; last check %s: %s\n' "$following" "$(when "$checked")" \
+            "$result${detail:+ - $detail}"
+    else
+        printf '  updates   following %s; not checked yet\n' "$following"
+    fi
+    printf '            next check: %s (now: sudo hidway-update)\n' "$next"
+    if [[ -s $SYSTEM_PENDING ]]; then
+        printf '  system    newer service files -> review, then: sudo hidway-update --apply-system\n'
+    else
+        printf '  system    service files up to date\n'
+    fi
+    printf '  releases\n'
     while read -r d; do
         mark=' '
         [[ $d == "$prev" ]] && mark='<'
         [[ $d == "$cur" ]] && mark='*'
-        [[ -e $d/FAILED ]] && mark='!'
-        printf '  %s %-13s %-24s built %s\n' "$mark" "$(basename "$d")" \
-            "$(release_field "$d" version)" "$(release_field "$d" built)"
+        held=$(held_reason "$d")
+        printf '    %s %-24s built %s%s\n' "$mark" "$(release_field "$d" version)" \
+            "$(release_field "$d" built)" "${held:+  (held: $held)}"
     done < <(list_releases)
+    printf '    (* current, < previous)\n'
+    return "$level"
+}
+
+# Anything that fails without its own message still leaves a record.
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+on_exit() {
+    local rc=$?
+    if ((rc != 0)) && [[ $(field "$UPDATE_STATUS" run) != "$$" ]]; then
+        record failed "unexpected error (exit $rc), see: journalctl -u hidway-update"
+    fi
 }
 
 main() {
-    local mode=update force=0
-    case ${1:-} in
-    '') ;;
-    --auto) QUIET=1 ;;
-    --now) force=1 ;;
-    --check) mode=check ;;
-    --rollback) mode=rollback ;;
-    --apply-system) mode=apply-system ;;
-    --status) mode=status ;;
-    -h | --help)
-        sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
-        return 0
-        ;;
-    *) die "unknown option: $1 (see --help)" ;;
-    esac
+    local mode=update force=0 short=0
+    if [[ $(basename "$0") == hidway-status ]]; then
+        mode=status
+        [[ ${1:-} == --short ]] && short=1
+    else
+        case ${1:-} in
+        '') ;;
+        --auto) QUIET=1 ;;
+        --now) force=1 ;;
+        --check) mode=check ;;
+        --rollback) mode=rollback ;;
+        --apply-system) mode=apply-system ;;
+        --status)
+            mode=status
+            [[ ${2:-} == --short ]] && short=1
+            ;;
+        -h | --help)
+            sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+            return 0
+            ;;
+        *) die "unknown option: $1 (see --help)" ;;
+        esac
+    fi
 
     if [[ $mode == status ]]; then
-        cmd_status
+        set +e # report as much as possible, whatever is missing
+        cmd_status "$short"
         return
     fi
     [[ $(id -u) == 0 || -n $ROOT ]] || die "run as root: sudo hidway-update ${1:-}"
@@ -349,9 +534,13 @@ main() {
     flock -n 9 || { log "another update is running"; return 0; }
 
     case $mode in
-    update) cmd_update "$force" ;;
+    update)
+        RECORD=1
+        trap on_exit EXIT
+        cmd_update "$force"
+        ;;
     check) cmd_check ;;
-    rollback) cmd_rollback ;;
+    rollback) RECORD=1 && cmd_rollback ;;
     apply-system) cmd_apply_system ;;
     esac
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh - remove the HIDway relay from this Pi.
 #
-#   sudo relay/deploy/uninstall.sh            stop and remove services, udev rule, command
+#   sudo relay/deploy/uninstall.sh            stop and remove services, udev rule, commands
 #   sudo relay/deploy/uninstall.sh --purge    also remove /opt/hidway, /etc/hidway and the users
 #
 # The configuration is backed up to /var/backups/hidway/<timestamp>/ first;
@@ -40,7 +40,7 @@ main() {
     say "removing service files"
     for f in etc/systemd/system/hidwayd.service etc/systemd/system/hidway-update.service \
         etc/systemd/system/hidway-update.timer etc/udev/rules.d/99-hidway.rules \
-        usr/local/sbin/hidway-update; do
+        etc/update-motd.d/60-hidway usr/local/bin/hidway-status usr/local/sbin/hidway-update; do
         rm -f "$ROOT/$f"
     done
     "$SYSTEMCTL" daemon-reload

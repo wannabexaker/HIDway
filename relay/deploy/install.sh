@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh - set up the HIDway relay on a Raspberry Pi (Raspberry Pi OS / Debian).
 #
-#   sudo relay/deploy/install.sh [--ref BRANCH|latest-tag] [--repo URL]
+#   sudo relay/deploy/install.sh [--ref latest-tag|BRANCH] [--repo URL]
 #
 # Safe to run again at any time. It never overwrites /etc/hidway/*.conf, and
 # backs up every file it replaces (and the current config) under
@@ -12,9 +12,10 @@
 #   /opt/hidway/src        checkout the Pi follows
 #   /opt/hidway/releases   built releases; current/previous are symlinks
 #   /etc/hidway/           hidwayd.conf, update.conf
-#   systemd   hidwayd.service, hidway-update.timer (every 5 minutes)
+#   systemd   hidwayd.service, hidway-update.timer (daily release check)
 #   udev      /dev/hidway-serial for the Raspberry Pi Debug Probe
-#   command   /usr/local/sbin/hidway-update
+#   commands  /usr/local/sbin/hidway-update, /usr/local/bin/hidway-status
+#   login     one status line (/etc/update-motd.d/60-hidway)
 #
 # Internal: install.sh --refresh <dir> installs the service files found in
 # <dir>; hidway-update --apply-system uses it.
@@ -34,7 +35,7 @@ BACKUP_KEEP=10
 STAMP=$(date +%Y%m%d-%H%M%S)
 
 REPO=
-REF=main
+REF=latest-tag
 REPO_SET=0
 REF_SET=0
 CHANGED=0
@@ -104,6 +105,12 @@ install_system_files() { # install_system_files <dir>
     put "$d/hidway-update.timer" "$ROOT/etc/systemd/system/hidway-update.timer" 0644
     put "$d/99-hidway.rules" "$ROOT/etc/udev/rules.d/99-hidway.rules" 0644
     put "$d/hidway-update" "$ROOT/usr/local/sbin/hidway-update" 0755
+    put "$d/60-hidway" "$ROOT/etc/update-motd.d/60-hidway" 0755
+    if [[ $(readlink "$ROOT/usr/local/bin/hidway-status" 2>/dev/null) != ../sbin/hidway-update ]]; then
+        mkdir -p "$ROOT/usr/local/bin"
+        ln -sfn ../sbin/hidway-update "$ROOT/usr/local/bin/hidway-status"
+        say "installed /usr/local/bin/hidway-status"
+    fi
     if [[ $CHANGED == 1 ]]; then
         "$SYSTEMCTL" daemon-reload
         "$UDEVADM" control --reload-rules
@@ -174,7 +181,9 @@ full_install() {
     # Build the first release and install the service files of that same
     # commit, both through the updater, so everything comes from one source.
     say "building the relay"
-    HIDWAY_ROOT=$ROOT HIDWAY_BUILD_USER=$BUILD_USER bash "$here/hidway-update" --now
+    HIDWAY_ROOT=$ROOT HIDWAY_BUILD_USER=$BUILD_USER bash "$here/hidway-update" --now ||
+        die "first build failed (see above). With no release tag yet, either tag one
+       (git tag -a v0.1.0 -m 'HIDway 0.1.0' && git push origin v0.1.0) or install with --ref main"
     say "service files"
     HIDWAY_ROOT=$ROOT HIDWAY_BUILD_USER=$BUILD_USER bash "$here/hidway-update" --apply-system
 
@@ -185,13 +194,13 @@ full_install() {
     if configured; then
         "$SYSTEMCTL" enable hidwayd.service
         "$SYSTEMCTL" restart hidwayd.service
-        say "done: hidwayd is running and follows '$(sed -n 's/^HIDWAY_REF=//p' "$ETC/update.conf")'"
+        say "done: hidwayd is running"
     else
         say "installed. Next:"
         echo "    1. sudo nano /etc/hidway/hidwayd.conf     (replace the <placeholders>)"
         echo "    2. sudo systemctl enable --now hidwayd"
     fi
-    echo "    status:    hidway-update --status"
+    echo "    status:    hidway-status"
     echo "    logs:      journalctl -u hidwayd -u hidway-update -f"
     echo "    backups:   /var/backups/hidway/"
 }

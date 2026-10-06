@@ -1,12 +1,12 @@
 [Unit]
-Description=Check for HIDway relay updates every 5 minutes
+Description=Daily check for a new HIDway relay release
 Documentation=file:/opt/hidway/src/docs/RELAY.md
 
 [Timer]
-OnBootSec=2min
-OnActiveSec=1min
-OnUnitInactiveSec=5min
-RandomizedDelaySec=30s
+# Once a day at a quiet hour; a missed check (Pi off) runs at the next boot.
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=30min
+Persistent=true
 
 [Install]
 WantedBy=timers.target

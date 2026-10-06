@@ -31,10 +31,15 @@ These rules are standing policy for the whole project:
 - `firmware/`: Pico SDK + TinyUSB, separate CMake project (ARM cross toolchain). `HIDWAY_T0=ON` builds the Phase-0 BOOTSEL test mode.
 - `relay/`: `hidwayd`, plain C + Makefile (no cmake needed on the Pi).
   `relay/deploy/`: Pi install, systemd units, udev rule, `hidway-update`
-  (auto-update with rollback). See `docs/RELAY.md`.
+  (release deployment with rollback) and `hidway-status`. See `docs/RELAY.md`.
 - `client/`: Win32 GUI, built with the host CMake build on Windows.
 - `tests/`: host tests for `common/`, run with ctest.
 - `tools/build.ps1`: builds firmware and tests (uses VS vcvars, `~/.pico-sdk`).
+
+## Releases
+The Pi deploys release tags `vX.Y.Z` only (annotated, on `main`); pushes to
+`main` never reach it. Tag only a commit whose `make check` passes. Branches
+`backup/*` are safety snapshots: never delete or rewrite them.
 
 ## Build
 - Host tests + client (Windows): `powershell -ExecutionPolicy Bypass -File tools\build.ps1`
