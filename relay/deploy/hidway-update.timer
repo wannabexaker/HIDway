@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for HIDway relay updates every 5 minutes
+Documentation=file:/opt/hidway/src/docs/RELAY.md
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=1min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

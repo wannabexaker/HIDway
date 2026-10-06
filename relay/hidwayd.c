@@ -2,16 +2,19 @@
  * hidwayd - HIDway relay for the Raspberry Pi.
  *
  * Receives full-state input packets from the client over UDP (through
- * Tailscale), keeps only the latest, and (later) forwards it to the Pico over
- * a serial link. It echoes a status packet back to the client for RTT and
- * loss measurement.
- *
- * Step 1 (this build): no serial yet. It validates and accounts for packets,
- * prints a once-per-second summary, and echoes status. The serial output and
- * the fail-safe "release all on link loss" are wired at the marked points.
+ * Tailscale), keeps only the latest, and forwards it to the Pico over a
+ * serial link. It echoes a status packet back to the client for RTT and loss
+ * measurement.
  *
  * Principles: accept only from the allowed peer; never queue (keep the latest
  * state only); treat loss of the client as "release everything".
+ *
+ * Serial link: the device may come and go (probe unplugged, Pico reset). The
+ * relay keeps running, retries the open once per second and starts every new
+ * connection with a RELEASE so the Pico begins from a known state. While the
+ * tty still holds an unsent frame, newer states replace the pending one
+ * instead of queueing behind it. A RELEASE discards anything pending and is
+ * always written.
  */
 #define _GNU_SOURCE /* cfmakeraw, CRTSCTS, getopt_long, clock_gettime */
 #include <arpa/inet.h>
@@ -25,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <time.h>
@@ -33,8 +37,18 @@
 #include "protocol.h"
 #include "serial.h"
 
-#define LINK_TIMEOUT_MS 250
-#define STATS_PERIOD_MS 1000
+#ifndef HIDWAY_VERSION
+#define HIDWAY_VERSION "dev"
+#endif
+
+#define LINK_TIMEOUT_MS   250
+#define STATS_PERIOD_MS   1000
+#define SERIAL_RETRY_MS   1000
+#define RATE_LIMIT_PPS    2000 /* accepted packets per second, RELEASE exempt */
+#define POLL_IDLE_MS      50
+#define POLL_PENDING_MS   1    /* a state is waiting for the tty to drain */
+
+#define STATUS_FLAG_SERIAL_OPEN 0x0002
 
 static volatile sig_atomic_t running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
@@ -45,6 +59,20 @@ static uint64_t now_ms(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
+
+/* ------------------------------------------------------------ serial link */
+
+typedef struct {
+    const char *dev;      /* NULL: no serial configured (dump/echo mode) */
+    int baud;
+    int fd;               /* -1 while closed */
+    int last_errno;       /* last open failure, to log only on change */
+    uint64_t next_try_ms; /* next open attempt while closed */
+    bool have_pending;    /* a frame is waiting for the tty to drain */
+    bool resync;          /* a frame went out partially; start the next with 0x00 */
+    hidway_serial_state_t pending;
+    uint32_t replaced;    /* states superseded before they were written */
+} serial_link_t;
 
 static speed_t baud_const(int baud)
 {
@@ -58,71 +86,170 @@ static speed_t baud_const(int baud)
     }
 }
 
-static int serial_open(const char *dev, int baud)
+static void serial_close(serial_link_t *l, uint64_t t)
 {
-    speed_t sp = baud_const(baud);
-    if (!sp) {
-        fprintf(stderr, "unsupported baud: %d\n", baud);
-        return -1;
-    }
-    int fd = open(dev, O_WRONLY | O_NOCTTY | O_CLOEXEC);
-    if (fd < 0) {
-        perror("open serial");
-        return -1;
-    }
-    struct termios t;
-    if (tcgetattr(fd, &t) == 0) {
-        cfmakeraw(&t);
-        cfsetospeed(&t, sp);
-        cfsetispeed(&t, sp);
-        t.c_cflag |= CLOCAL | CREAD;
-        t.c_cflag &= (tcflag_t)~CRTSCTS;
-        tcsetattr(fd, TCSANOW, &t);
-    }
-    return fd;
+    close(l->fd);
+    l->fd = -1;
+    l->have_pending = false;
+    l->resync = false;
+    l->next_try_ms = t + SERIAL_RETRY_MS;
 }
 
-/* Write one complete frame. Serial is fast (one frame ~0.5 ms at 921600) and
- * we write at most at the incoming rate, so this never backs up into a queue. */
-static void serial_write_frame(int fd, const hidway_serial_state_t *s)
+/* Write one frame without blocking. Returns true once it is fully written.
+ * If only part of it went out, the next frame starts with a delimiter so the
+ * receiver drops the fragment (CRC) and decodes the next frame cleanly. On a
+ * hard error the link is closed and reopened later. */
+static bool serial_write_frame(serial_link_t *l, const hidway_serial_state_t *s)
 {
-    if (fd < 0)
-        return;
-    uint8_t f[HIDWAY_SER_FRAME_MAX];
-    size_t n = hidway_serial_build(s, f, sizeof f);
-    size_t off = 0;
+    uint8_t f[1 + HIDWAY_SER_FRAME_MAX];
+    f[0] = 0x00;
+    size_t n = 1 + hidway_serial_build(s, f + 1, sizeof f - 1);
+    size_t start = l->resync ? 0 : 1;
+    size_t off = start;
     while (off < n) {
-        ssize_t w = write(fd, f + off, n - off);
+        ssize_t w = write(l->fd, f + off, n - off);
         if (w < 0) {
             if (errno == EINTR)
                 continue;
-            break; /* drop; the next frame carries full state again */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (off > start)
+                    l->resync = true;
+                return false; /* kept pending, retried shortly */
+            }
+            fprintf(stderr, "hidwayd: serial write failed (%s), closing\n", strerror(errno));
+            serial_close(l, now_ms());
+            return false;
         }
         off += (size_t)w;
     }
+    l->resync = false;
+    return true;
 }
 
-static void serial_send_state(int fd, const hidway_input_pkt_t *p)
+/* Write the pending frame once the tty has nothing left to send. */
+static void serial_pump(serial_link_t *l)
 {
-    hidway_serial_state_t s;
-    s.type = HIDWAY_SER_STATE;
-    s.seq = (uint16_t)p->seq;
-    s.mods = p->mods;
-    memcpy(s.keys, p->keys, HIDWAY_KEY_BITMAP_BYTES);
-    s.buttons = p->buttons;
-    s.x = p->x;
-    s.y = p->y;
-    s.wheel = p->wheel;
-    s.pan = p->pan;
-    serial_write_frame(fd, &s);
+    if (!l->have_pending || l->fd < 0)
+        return;
+    int outq = 0;
+    if (ioctl(l->fd, TIOCOUTQ, &outq) == 0 && outq > 0)
+        return;
+    if (serial_write_frame(l, &l->pending))
+        l->have_pending = false;
 }
 
-static void serial_send_release(int fd, uint16_t seq)
+/* Release everything: discard whatever is still queued and send RELEASE
+ * ahead of anything else. */
+static void serial_send_release(serial_link_t *l, uint16_t seq)
 {
-    hidway_serial_state_t s = {0};
-    s.type = HIDWAY_SER_RELEASE;
-    s.seq = seq;
-    serial_write_frame(fd, &s);
+    l->have_pending = false;
+    if (l->fd < 0)
+        return;
+    tcflush(l->fd, TCOFLUSH);
+    l->resync = true; /* the flush may have cut a frame short */
+    memset(&l->pending, 0, sizeof l->pending);
+    l->pending.type = HIDWAY_SER_RELEASE;
+    l->pending.seq = seq;
+    l->have_pending = true;
+    serial_pump(l);
+}
+
+static void serial_open(serial_link_t *l, uint64_t t)
+{
+    if (!l->dev || l->fd >= 0 || t < l->next_try_ms)
+        return;
+    l->next_try_ms = t + SERIAL_RETRY_MS;
+
+    int fd = open(l->dev, O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno != l->last_errno)
+            fprintf(stderr, "hidwayd: serial %s unavailable (%s), retrying every %d ms\n",
+                    l->dev, strerror(errno), SERIAL_RETRY_MS);
+        l->last_errno = errno;
+        return;
+    }
+    struct termios tio;
+    if (tcgetattr(fd, &tio) == 0) {
+        cfmakeraw(&tio);
+        cfsetospeed(&tio, baud_const(l->baud));
+        cfsetispeed(&tio, baud_const(l->baud));
+        tio.c_cflag |= CLOCAL | CREAD;
+        tio.c_cflag &= (tcflag_t)~CRTSCTS;
+        tcsetattr(fd, TCSANOW, &tio);
+    }
+    l->fd = fd;
+    l->last_errno = 0;
+    fprintf(stderr, "hidwayd: serial %s open at %d baud\n", l->dev, l->baud);
+    serial_send_release(l, 0); /* every connection starts from "nothing held" */
+}
+
+static void serial_send_state(serial_link_t *l, const hidway_input_pkt_t *p)
+{
+    if (l->fd < 0)
+        return;
+    if (l->have_pending)
+        l->replaced++;
+    hidway_serial_state_t *s = &l->pending;
+    s->type = HIDWAY_SER_STATE;
+    s->seq = (uint16_t)p->seq;
+    s->mods = p->mods;
+    memcpy(s->keys, p->keys, HIDWAY_KEY_BITMAP_BYTES);
+    s->buttons = p->buttons;
+    s->x = p->x;
+    s->y = p->y;
+    s->wheel = p->wheel;
+    s->pan = p->pan;
+    l->have_pending = true;
+    serial_pump(l);
+}
+
+/* ------------------------------------------------------------ state file */
+
+/* A small key=value file for local tooling (hidway-update, monitoring).
+ * Written atomically on every change; removed on exit. */
+static void write_state_file(const char *path, bool link_up, const serial_link_t *l,
+                             bool have_session, uint32_t session)
+{
+    if (!path)
+        return;
+    char tmp[512];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp)
+        return;
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fprintf(f, "version=%s\npid=%ld\nlink=%s\nserial=%s\n", HIDWAY_VERSION, (long)getpid(),
+            link_up ? "up" : "down", !l->dev ? "none" : l->fd >= 0 ? "open" : "closed");
+    if (have_session)
+        fprintf(f, "session=%08x\n", session);
+    if (fclose(f) == 0)
+        rename(tmp, path);
+    else
+        unlink(tmp);
+}
+
+/* ------------------------------------------------------------ rate limit */
+
+/* Fixed one-second window. Real input is at most ~1 kHz, so the cap only
+ * bounds a misbehaving or hostile sender. */
+typedef struct {
+    uint64_t window_ms;
+    uint32_t count;
+    uint32_t drops;
+} rate_limit_t;
+
+static bool rate_allow(rate_limit_t *r, uint64_t t)
+{
+    if (t - r->window_ms >= 1000) {
+        r->window_ms = t;
+        r->count = 0;
+    }
+    if (r->count >= RATE_LIMIT_PPS) {
+        r->drops++;
+        return false;
+    }
+    r->count++;
+    return true;
 }
 
 static int popcount_bitmap(const uint8_t *bm, size_t n)
@@ -134,14 +261,22 @@ static int popcount_bitmap(const uint8_t *bm, size_t n)
     return c;
 }
 
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "usage: %s [--bind IP] [--allow IP] [--port N] [--serial DEV] [--baud N]\n"
+            "          [--state-file PATH] [--quiet] [--version]\n",
+            argv0);
+}
+
 int main(int argc, char **argv)
 {
     const char *bind_addr = "0.0.0.0";
     const char *allow_addr = NULL; /* if set, only accept this source IP */
-    const char *serial_dev = NULL; /* if set, forward to the Pico here */
-    int baud = 921600;
+    const char *state_path = NULL; /* if set, publish link/serial state here */
     int port = 47800;
     int quiet = 0;
+    serial_link_t ser = {.baud = 921600, .fd = -1};
 
     static const struct option opts[] = {
         {"bind", required_argument, 0, 'b'},
@@ -149,29 +284,38 @@ int main(int argc, char **argv)
         {"port", required_argument, 0, 'p'},
         {"serial", required_argument, 0, 's'},
         {"baud", required_argument, 0, 'B'},
+        {"state-file", required_argument, 0, 'S'},
         {"quiet", no_argument, 0, 'q'},
+        {"version", no_argument, 0, 'V'},
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "b:a:p:s:B:q", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "b:a:p:s:B:S:qV", opts, NULL)) != -1) {
         switch (c) {
         case 'b': bind_addr = optarg; break;
         case 'a': allow_addr = optarg; break;
         case 'p': port = atoi(optarg); break;
-        case 's': serial_dev = optarg; break;
-        case 'B': baud = atoi(optarg); break;
+        case 's': ser.dev = optarg; break;
+        case 'B': ser.baud = atoi(optarg); break;
+        case 'S': state_path = optarg; break;
         case 'q': quiet = 1; break;
-        default:
-            fprintf(stderr, "usage: %s [--bind IP] [--allow IP] [--port N]"
-                            " [--serial DEV] [--baud N] [--quiet]\n", argv[0]);
-            return 2;
+        case 'V': printf("hidwayd %s\n", HIDWAY_VERSION); return 0;
+        default: usage(argv[0]); return 2;
         }
+    }
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "bad port: %d\n", port);
+        return 2;
+    }
+    if (ser.dev && !baud_const(ser.baud)) {
+        fprintf(stderr, "unsupported baud: %d\n", ser.baud);
+        return 2;
     }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) { perror("socket"); return 1; }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -191,16 +335,13 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    int serial_fd = -1;
-    if (serial_dev) {
-        serial_fd = serial_open(serial_dev, baud);
-        if (serial_fd < 0)
-            fprintf(stderr, "hidwayd: continuing without serial (dump/echo only)\n");
-    }
-
-    fprintf(stderr, "hidwayd: listening on %s:%d%s%s | serial: %s\n",
+    fprintf(stderr, "hidwayd %s: listening on %s:%d%s%s | serial: %s\n", HIDWAY_VERSION,
             bind_addr, port, allow_addr ? ", allow=" : "", allow_addr ? allow_addr : "",
-            serial_fd >= 0 ? serial_dev : "none (dump/echo mode)");
+            ser.dev ? ser.dev : "none (dump/echo mode)");
+    if (!allow_addr)
+        fprintf(stderr, "hidwayd: WARNING no --allow set, accepting any source\n");
+
+    serial_open(&ser, now_ms());
 
     /* Per-session accounting. */
     uint32_t session = 0;
@@ -214,51 +355,72 @@ int main(int argc, char **argv)
     uint64_t last_pkt_ms = 0;
     uint64_t next_stats_ms = now_ms() + STATS_PERIOD_MS;
     uint32_t in_this_sec = 0, in_pps = 0;
+    rate_limit_t rate = {.window_ms = now_ms()};
+
+    /* Published state; the file is rewritten only when one of these changes. */
+    bool pub_link = false, pub_serial = ser.fd >= 0, pub_session = false;
+    uint32_t pub_session_id = 0;
+    write_state_file(state_path, link_up, &ser, have_session, session);
 
     while (running) {
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, 50);
+        struct pollfd pfd[2] = {
+            {.fd = fd, .events = POLLIN},
+            {.fd = ser.fd, .events = 0}, /* POLLHUP/POLLERR: device gone */
+        };
+        int pr = poll(pfd, ser.fd >= 0 ? 2 : 1, ser.have_pending ? POLL_PENDING_MS : POLL_IDLE_MS);
         uint64_t t = now_ms();
 
-        if (pr > 0 && (pfd.revents & POLLIN)) {
+        if (pr > 0 && ser.fd >= 0 && (pfd[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            fprintf(stderr, "hidwayd: serial %s disconnected\n", ser.dev);
+            serial_close(&ser, t);
+        }
+
+        if (pr > 0 && (pfd[0].revents & POLLIN)) {
             uint8_t buf[128];
             struct sockaddr_in from;
             socklen_t fromlen = sizeof from;
             ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
+            hidway_input_pkt_t p;
             if (n < 0) {
                 if (errno != EINTR) perror("recvfrom");
-            } else if (!allow_addr || from.sin_addr.s_addr == allow_in.s_addr) {
-                hidway_input_pkt_t p;
-                if (hidway_input_decode(buf, (size_t)n, &p) && p.type == HIDWAY_MSG_PROBE) {
-                    /* Reachability ping: reply, but do not touch link state,
-                     * the latest input, the serial link or the counters. */
-                    hidway_status_pkt_t st = {0};
-                    st.session_id = p.session_id;
-                    st.seq = last_seq;
-                    st.client_time_us = p.client_time_us;
-                    st.frames_ok = frames_ok;
-                    st.seq_gaps = seq_gaps;
-                    st.flags = (serial_fd >= 0) ? 0x0002 : 0;
-                    uint8_t sb[HIDWAY_STATUS_PKT_LEN];
-                    size_t sl = hidway_status_encode(sb, &st);
-                    sendto(fd, sb, sl, 0, (struct sockaddr *)&from, fromlen);
-                } else if (hidway_input_decode(buf, (size_t)n, &p)) {
-                    if (!have_session || p.session_id != session) {
-                        session = p.session_id;
-                        have_session = true;
-                        last_seq = p.seq;   /* baseline; no gap for the first */
-                        frames_ok = 0;
-                        seq_gaps = 0;
-                        fprintf(stderr, "hidwayd: new session %08x\n", session);
-                    } else if (p.seq > last_seq) {
-                        seq_gaps = (uint16_t)(seq_gaps + (p.seq - last_seq - 1));
-                        last_seq = p.seq;
-                    } else {
-                        /* stale or duplicate: cumulative state makes this safe
-                         * to drop entirely */
-                        goto after_apply;
-                    }
+            } else if (allow_addr && from.sin_addr.s_addr != allow_in.s_addr) {
+                /* not our peer: drop silently */
+            } else if (!hidway_input_decode(buf, (size_t)n, &p)) {
+                /* malformed: drop */
+            } else if (p.type != HIDWAY_MSG_RELEASE && !rate_allow(&rate, t)) {
+                /* over the sanity cap: drop (a RELEASE always passes) */
+            } else if (p.type == HIDWAY_MSG_PROBE) {
+                /* Reachability ping: reply, but do not touch link state,
+                 * the latest input, the serial link or the counters. */
+                hidway_status_pkt_t st = {0};
+                st.session_id = p.session_id;
+                st.seq = last_seq;
+                st.client_time_us = p.client_time_us;
+                st.frames_ok = frames_ok;
+                st.seq_gaps = seq_gaps;
+                st.flags = ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0;
+                uint8_t sb[HIDWAY_STATUS_PKT_LEN];
+                size_t sl = hidway_status_encode(sb, &st);
+                sendto(fd, sb, sl, 0, (struct sockaddr *)&from, fromlen);
+            } else {
+                bool accept = true;
+                if (!have_session || p.session_id != session) {
+                    session = p.session_id;
+                    have_session = true;
+                    last_seq = p.seq; /* baseline; no gap for the first */
+                    frames_ok = 0;
+                    seq_gaps = 0;
+                    fprintf(stderr, "hidwayd: new session %08x\n", session);
+                } else if (p.seq > last_seq) {
+                    seq_gaps = (uint16_t)(seq_gaps + (p.seq - last_seq - 1));
+                    last_seq = p.seq;
+                } else {
+                    /* stale or duplicate: cumulative state makes this safe
+                     * to drop entirely */
+                    accept = false;
+                }
 
+                if (accept) {
                     frames_ok++;
                     in_this_sec++;
                     latest = p;
@@ -266,7 +428,10 @@ int main(int argc, char **argv)
                     last_pkt_ms = t;
 
                     /* Forward the latest full state to the Pico. */
-                    serial_send_state(serial_fd, &latest);
+                    if (p.type == HIDWAY_MSG_RELEASE)
+                        serial_send_release(&ser, (uint16_t)p.seq);
+                    else
+                        serial_send_state(&ser, &latest);
 
                     /* Echo status back for RTT/loss measurement. */
                     hidway_status_pkt_t st = {0};
@@ -275,7 +440,7 @@ int main(int argc, char **argv)
                     st.client_time_us = p.client_time_us;
                     st.frames_ok = frames_ok;
                     st.seq_gaps = seq_gaps;
-                    st.flags = (serial_fd >= 0) ? 0x0002 : 0; /* bit1: relay serial open */
+                    st.flags = ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0;
                     st.leds = 0;
                     uint8_t sb[HIDWAY_STATUS_PKT_LEN];
                     size_t sl = hidway_status_encode(sb, &st);
@@ -283,12 +448,23 @@ int main(int argc, char **argv)
                 }
             }
         }
-    after_apply:
 
         if (link_up && t - last_pkt_ms > LINK_TIMEOUT_MS) {
             link_up = false;
             fprintf(stderr, "hidwayd: LINK TIMEOUT -> release all\n");
-            serial_send_release(serial_fd, (uint16_t)(last_seq + 1));
+            serial_send_release(&ser, (uint16_t)(last_seq + 1));
+        }
+
+        serial_open(&ser, t);
+        serial_pump(&ser);
+
+        if (link_up != pub_link || (ser.fd >= 0) != pub_serial || have_session != pub_session ||
+            session != pub_session_id) {
+            pub_link = link_up;
+            pub_serial = ser.fd >= 0;
+            pub_session = have_session;
+            pub_session_id = session;
+            write_state_file(state_path, link_up, &ser, have_session, session);
         }
 
         if (t >= next_stats_ms) {
@@ -298,18 +474,24 @@ int main(int argc, char **argv)
             if (!quiet && have_session) {
                 int nkeys = popcount_bitmap(latest.keys, HIDWAY_KEY_BITMAP_BYTES);
                 fprintf(stderr,
-                        "in=%4u/s ok=%-8u gaps=%-4u link=%s | mods=%02x keys=%d btn=%02x x=%ld y=%ld\n",
+                        "in=%4u/s ok=%-8u gaps=%-4u link=%s serial=%s replaced=%u ratedrop=%u"
+                        " | mods=%02x keys=%d btn=%02x x=%ld y=%ld\n",
                         in_pps, frames_ok, seq_gaps, link_up ? "up" : "DOWN",
-                        latest.mods, nkeys, latest.buttons, (long)latest.x, (long)latest.y);
+                        !ser.dev ? "none" : ser.fd >= 0 ? "open" : "CLOSED", ser.replaced,
+                        rate.drops, latest.mods, nkeys, latest.buttons, (long)latest.x,
+                        (long)latest.y);
             }
         }
     }
 
     fprintf(stderr, "hidwayd: shutting down\n");
-    if (serial_fd >= 0) {
-        serial_send_release(serial_fd, (uint16_t)(last_seq + 1));
-        close(serial_fd);
+    serial_send_release(&ser, (uint16_t)(last_seq + 1));
+    if (ser.fd >= 0) {
+        tcdrain(ser.fd);
+        close(ser.fd);
     }
+    if (state_path)
+        unlink(state_path);
     close(fd);
     return 0;
 }

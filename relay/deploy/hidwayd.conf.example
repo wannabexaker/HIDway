@@ -1,0 +1,20 @@
+# HIDway relay settings, read by hidwayd.service.
+# Installed as /etc/hidway/hidwayd.conf (never overwritten by updates).
+# Replace every <placeholder>, then: sudo systemctl enable --now hidwayd
+
+# Tailscale address of this Pi; hidwayd listens on this address only.
+HIDWAY_BIND=<pi-tailscale-ip>
+
+# Tailscale address of the remote PC; packets from any other source are dropped.
+HIDWAY_ALLOW=<client-tailscale-ip>
+
+HIDWAY_PORT=47800
+
+# Serial device of the Pi -> Pico link. /dev/hidway-serial is created by the
+# udev rule for the Raspberry Pi Debug Probe; for another adapter use its
+# /dev/serial/by-id/... path (and give the hidway group access to it).
+HIDWAY_SERIAL=/dev/hidway-serial
+HIDWAY_BAUD=921600
+
+# Extra options. Remove --quiet to log a once-per-second summary.
+HIDWAY_EXTRA_OPTS="--quiet"

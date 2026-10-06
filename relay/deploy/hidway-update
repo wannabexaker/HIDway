@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# hidway-update - keep the HIDway relay on this Pi in sync with the repository.
+#
+#   hidway-update                 update if needed; restart only when idle
+#   hidway-update --now           update and restart even during a live session
+#   hidway-update --check         report whether an update is available
+#   hidway-update --rollback      switch back to the previous release
+#   hidway-update --apply-system  install changed service files (units, udev, updater)
+#   hidway-update --status        show what is installed and running
+#   hidway-update --auto          timer mode: like the default, quiet when idle
+#
+# Releases: every release is built from a clean checkout by an unprivileged
+# build user, must pass the unit tests, and is installed into its own
+# directory under releases/. "current" is switched atomically, the previous
+# release is kept for an instant rollback, and a release that does not come
+# up healthy is rolled back automatically. A restart while a session is live
+# is deferred: the Pico would release every key, which is safe but not
+# something to do in the middle of a game.
+#
+# System files: the relay binary runs unprivileged and sandboxed, so it is
+# updated automatically. Service files run as root, so changes to them are
+# only announced and applied with an explicit --apply-system.
+set -euo pipefail
+umask 022
+
+ROOT=${HIDWAY_ROOT:-} # prefix, for testing only
+HOME_DIR=$ROOT/opt/hidway
+SRC=$HOME_DIR/src
+RELEASES=$HOME_DIR/releases
+CURRENT=$HOME_DIR/current
+PREVIOUS=$HOME_DIR/previous
+SYSTEM_COMMIT=$HOME_DIR/system-commit   # commit of the installed service files
+SYSTEM_PENDING=$HOME_DIR/system-pending # newer service files waiting for --apply-system
+ETC=$ROOT/etc/hidway
+STATE_FILE=$ROOT/run/hidway/state
+LOCK_FILE=$ROOT/run/lock/hidway-update.lock
+SYSTEMCTL=${HIDWAY_SYSTEMCTL:-systemctl}
+SERVICE=hidwayd.service
+HEALTH_TIMEOUT=10
+DEPLOY_FILES=(install.sh hidway-update hidwayd.service hidway-update.service
+    hidway-update.timer 99-hidway.rules)
+
+# Defaults; /etc/hidway/update.conf overrides them.
+HIDWAY_REPO= # empty: keep the checkout's origin
+HIDWAY_REF=main
+HIDWAY_KEEP=3
+HIDWAY_BUILD_USER=${HIDWAY_BUILD_USER-hidway-build}
+if [[ -r $ETC/update.conf ]]; then
+    # shellcheck source=/dev/null
+    . "$ETC/update.conf"
+fi
+
+QUIET=0
+log() { [[ $QUIET == 1 ]] || printf 'hidway-update: %s\n' "$*" >&2; }
+note() { printf 'hidway-update: %s\n' "$*" >&2; } # shown in --auto too (journal)
+die() { printf 'hidway-update: error: %s\n' "$*" >&2; exit 1; }
+
+# Run as the unprivileged build user: fetching, compiling and running freshly
+# built code never happen as root.
+as_build() {
+    if [[ -n $HIDWAY_BUILD_USER && $(id -u) == 0 ]]; then
+        runuser -u "$HIDWAY_BUILD_USER" -- env HOME=/nonexistent "$@"
+    else
+        "$@"
+    fi
+}
+git_src() { as_build git -C "$SRC" "$@"; }
+checkout() { git_src -c advice.detachedHead=false checkout --quiet --force --detach "$1"; }
+
+release_field() { sed -n "s/^$2=//p" "$1/RELEASE" 2>/dev/null | head -n1; }
+state_field() { sed -n "s/^$1=//p" "$STATE_FILE" 2>/dev/null | head -n1; }
+link_target() { readlink "$1" 2>/dev/null || true; }
+list_releases() { # newest first
+    find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' 2>/dev/null |
+        sort -rn | cut -d' ' -f2-
+}
+
+# Point a symlink at a target atomically (rename over the old link).
+set_link() {
+    ln -sfn "$2" "$1.new"
+    mv -Tf "$1.new" "$1"
+}
+
+service_active() { "$SYSTEMCTL" is-active --quiet "$SERVICE"; }
+service_enabled() { "$SYSTEMCTL" is-enabled --quiet "$SERVICE" 2>/dev/null; }
+
+# ---------------------------------------------------------------- resolve
+
+fetch_target() { # prints the commit to deploy
+    if [[ -n $HIDWAY_REPO && $HIDWAY_REPO != *'<'* &&
+        $(git_src remote get-url origin) != "$HIDWAY_REPO" ]]; then
+        git_src remote set-url origin "$HIDWAY_REPO"
+    fi
+    git_src fetch --quiet --prune --tags origin
+    local ref
+    if [[ $HIDWAY_REF == latest-tag ]]; then
+        ref=$(git_src tag --list 'v*' --sort=-v:refname | head -n1)
+        [[ -n $ref ]] || die "no v* release tag found"
+    else
+        ref=origin/$HIDWAY_REF
+    fi
+    git_src rev-parse --verify --quiet "$ref^{commit}" || die "cannot resolve '$HIDWAY_REF'"
+}
+
+# True when <paths> differ between two commits (or the base is unknown).
+changed() { # changed <old> <new> <paths...>
+    local old=$1 new=$2
+    shift 2
+    [[ -n $old ]] && git_src cat-file -e "$old^{commit}" 2>/dev/null || return 0
+    ! git_src diff --quiet "$old" "$new" -- "$@"
+}
+
+# ---------------------------------------------------------------- build
+
+build_release() { # build_release <commit> -> prints the release dir
+    local commit=$1 short dir tmp version
+    short=$(git_src rev-parse --short=12 "$commit")
+    dir=$RELEASES/$short
+    if [[ -f $dir/RELEASE ]]; then
+        echo "$dir"
+        return
+    fi
+    log "building $short"
+    checkout "$commit"
+    git_src clean -fdxq
+    as_build make -s -C "$SRC/relay" hidwayd check >&2 || die "build or unit tests failed for $short"
+
+    version=$(git_src describe --always --tags "$commit")
+    [[ $(as_build "$SRC/relay/hidwayd" --version) == "hidwayd $version" ]] ||
+        die "built binary does not report version $version"
+
+    tmp=$(mktemp -d "$RELEASES/.build.XXXXXX")
+    as_build cat "$SRC/relay/hidwayd" >"$tmp/hidwayd"
+    chmod 0755 "$tmp" "$tmp/hidwayd"
+    cat >"$tmp/RELEASE" <<EOF
+commit=$commit
+version=$version
+ref=$HIDWAY_REF
+built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    mv -T "$tmp" "$dir"
+    echo "$dir"
+}
+
+# ---------------------------------------------------------------- activate
+
+wait_healthy() { # wait_healthy <version>
+    local i
+    for ((i = 0; i < HEALTH_TIMEOUT * 4; i++)); do
+        if service_active && [[ $(state_field version) == "$1" ]]; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+activate() { # activate <release dir>
+    local dir=$1 prev old_prev version was_active=0
+    version=$(release_field "$dir" version)
+    prev=$(link_target "$CURRENT")
+    old_prev=$(link_target "$PREVIOUS")
+
+    service_active && was_active=1
+    [[ -n $prev ]] && set_link "$PREVIOUS" "$prev"
+    set_link "$CURRENT" "$dir"
+    note "activated $version"
+
+    if [[ $was_active == 0 ]] && ! service_enabled; then
+        return 0 # not set up to run yet; nothing to restart
+    fi
+    "$SYSTEMCTL" restart "$SERVICE" || true
+    if [[ $was_active == 0 ]] || wait_healthy "$version"; then
+        note "hidwayd restarted on $version"
+        return 0
+    fi
+
+    # It ran before and does not now: put the previous release back.
+    touch "$dir/FAILED"
+    if [[ -n $prev ]]; then
+        set_link "$CURRENT" "$prev"
+        if [[ -n $old_prev ]]; then set_link "$PREVIOUS" "$old_prev"; else rm -f "$PREVIOUS"; fi
+        "$SYSTEMCTL" restart "$SERVICE" || true
+        die "$version did not come up healthy; rolled back to $(release_field "$prev" version)"
+    fi
+    die "$version did not come up healthy"
+}
+
+prune() { # prune [extra release dir to keep]
+    local cur prev kept=0 d
+    cur=$(link_target "$CURRENT")
+    prev=$(link_target "$PREVIOUS")
+    while read -r d; do
+        [[ $d == "$cur" || $d == "$prev" || $d == "${1:-}" ]] && continue
+        if ((kept + 2 < HIDWAY_KEEP)); then
+            kept=$((kept + 1))
+        else
+            rm -rf -- "$d"
+        fi
+    done < <(list_releases)
+    # Leftovers of interrupted builds.
+    find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.build.*' -mmin +60 -exec rm -rf {} +
+}
+
+# Announce newer service files once; they are applied with --apply-system.
+check_system_files() { # check_system_files <commit>
+    local installed
+    installed=$(cat "$SYSTEM_COMMIT" 2>/dev/null || true)
+    if ! changed "$installed" "$1" relay/deploy; then
+        rm -f "$SYSTEM_PENDING"
+        return 0
+    fi
+    if [[ $(cat "$SYSTEM_PENDING" 2>/dev/null || true) != "$1" ]]; then
+        echo "$1" >"$SYSTEM_PENDING"
+        # Before the first --apply-system (fresh install) there is nothing to announce.
+        [[ -z $installed ]] ||
+            note "service files changed upstream; review and apply with: sudo hidway-update --apply-system"
+    fi
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_update() { # cmd_update <force>
+    local force=$1 target cur cur_commit dir version
+    target=$(fetch_target)
+    cur=$(link_target "$CURRENT")
+    cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+
+    if [[ $target != "$cur_commit" ]] && changed "$cur_commit" "$target" relay common tests; then
+        dir=$(build_release "$target")
+        version=$(release_field "$dir" version)
+        if [[ -e $dir/FAILED && $force != 1 ]]; then
+            log "$version failed its health check before; skipping (hidway-update --now retries)"
+        elif [[ $(state_field link) == up && $force != 1 ]]; then
+            note "$version is ready; waiting for the live session to end (or run: hidway-update --now)"
+            prune "$dir"
+        else
+            rm -f "$dir/FAILED"
+            activate "$dir"
+            prune
+        fi
+    else
+        log "up to date ($(release_field "$cur" version))"
+    fi
+    check_system_files "$target"
+}
+
+cmd_check() {
+    local target cur cur_commit
+    target=$(fetch_target)
+    cur=$(link_target "$CURRENT")
+    cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+    if [[ $target != "$cur_commit" ]] && changed "$cur_commit" "$target" relay common tests; then
+        echo "update available: $(git_src describe --always --tags "$target")"
+        return 10
+    fi
+    echo "up to date"
+}
+
+cmd_rollback() {
+    local prev cur version
+    prev=$(link_target "$PREVIOUS")
+    cur=$(link_target "$CURRENT")
+    [[ -n $prev && -d $prev && $prev != "$cur" ]] || die "no previous release to roll back to"
+    version=$(release_field "$prev" version)
+    set_link "$PREVIOUS" "$cur"
+    set_link "$CURRENT" "$prev"
+    note "rolled back to $version"
+    if service_active || service_enabled; then
+        "$SYSTEMCTL" restart "$SERVICE"
+        wait_healthy "$version" || die "hidwayd not healthy after rollback"
+        note "hidwayd restarted on $version"
+    fi
+}
+
+# Install the service files of the running release. They are copied out of
+# the build user's checkout into a root-owned directory before anything runs.
+cmd_apply_system() {
+    local cur commit
+    cur=$(link_target "$CURRENT")
+    commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+    [[ -n $commit ]] || die "no release installed yet"
+    checkout "$commit"
+    (
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        for f in "${DEPLOY_FILES[@]}"; do
+            as_build cat "$SRC/relay/deploy/$f" >"$tmp/$f"
+        done
+        HIDWAY_ROOT=$ROOT bash "$tmp/install.sh" --refresh "$tmp"
+    )
+    echo "$commit" >"$SYSTEM_COMMIT"
+    rm -f "$SYSTEM_PENDING"
+    note "service files now match $(release_field "$cur" version)"
+}
+
+cmd_status() {
+    local cur prev d mark
+    cur=$(link_target "$CURRENT")
+    prev=$(link_target "$PREVIOUS")
+    printf 'service   : %s' "$("$SYSTEMCTL" is-active "$SERVICE" 2>/dev/null || true)"
+    if [[ -r $STATE_FILE ]]; then
+        printf ' | running %s | link %s | serial %s' \
+            "$(state_field version)" "$(state_field link)" "$(state_field serial)"
+    fi
+    printf '\nfollowing : %s (%s)\n' "$HIDWAY_REF" "$HIDWAY_REPO"
+    if [[ -s $SYSTEM_PENDING ]]; then
+        printf 'system    : newer service files available -> sudo hidway-update --apply-system\n'
+    else
+        printf 'system    : service files up to date\n'
+    fi
+    printf 'releases  : (* current, < previous, ! failed health check)\n'
+    while read -r d; do
+        mark=' '
+        [[ $d == "$prev" ]] && mark='<'
+        [[ $d == "$cur" ]] && mark='*'
+        [[ -e $d/FAILED ]] && mark='!'
+        printf '  %s %-13s %-24s built %s\n' "$mark" "$(basename "$d")" \
+            "$(release_field "$d" version)" "$(release_field "$d" built)"
+    done < <(list_releases)
+}
+
+main() {
+    local mode=update force=0
+    case ${1:-} in
+    '') ;;
+    --auto) QUIET=1 ;;
+    --now) force=1 ;;
+    --check) mode=check ;;
+    --rollback) mode=rollback ;;
+    --apply-system) mode=apply-system ;;
+    --status) mode=status ;;
+    -h | --help)
+        sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+        return 0
+        ;;
+    *) die "unknown option: $1 (see --help)" ;;
+    esac
+
+    if [[ $mode == status ]]; then
+        cmd_status
+        return
+    fi
+    [[ $(id -u) == 0 || -n $ROOT ]] || die "run as root: sudo hidway-update ${1:-}"
+    [[ -d $SRC/.git ]] || die "$SRC is not a checkout; run relay/deploy/install.sh first"
+
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { log "another update is running"; return 0; }
+
+    case $mode in
+    update) cmd_update "$force" ;;
+    check) cmd_check ;;
+    rollback) cmd_rollback ;;
+    apply-system) cmd_apply_system ;;
+    esac
+}
+
+main "$@"
+exit

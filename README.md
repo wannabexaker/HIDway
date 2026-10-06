@@ -110,10 +110,20 @@ On Windows, `tools/build.ps1` builds both the firmware and the host tests.
 
 ### Relay (`hidwayd`) on the Raspberry Pi
 
+As a service that keeps itself up to date (systemd unit, udev rule for the
+Debug Probe, automatic updates with rollback):
+
+```bash
+sudo relay/deploy/install.sh
+```
+
+See [docs/RELAY.md](docs/RELAY.md). To build and run it by hand instead:
+
 ```bash
 cd relay
-make
-./hidwayd --bind <pi-tailscale-ip> --allow <client-tailscale-ip> --port 47800
+make && make check
+./hidwayd --bind <pi-tailscale-ip> --allow <client-tailscale-ip> --port 47800 \
+          --serial /dev/hidway-serial
 ```
 
 ## Status

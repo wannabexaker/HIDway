@@ -34,7 +34,25 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 - [!] **12d. Relay redeploy for PROBE** — `hidwayd` with PROBE support is
   committed but not yet running on the Pi (SSH to the Pi was timing out over
   the relayed Tailscale path). Until then the disarmed client shows
-  "no reply from relay"; armed mode works.
+  "no reply from relay"; armed mode works. Once item 16 is installed on the
+  Pi (one `install.sh` run), this and every later relay change deploy
+  automatically.
+
+- [x] **16. Relay as a self-updating service** — `hidwayd`: serial reopen
+  with retry (probe unplug/replug), RELEASE on every new serial connection,
+  latest-only serial writes (`TIOCOUTQ`) with partial-write resync, 2000 pps
+  cap, `--version`, `--state-file`. `relay/deploy/`: `install.sh` /
+  `uninstall.sh`, hardened `hidwayd.service`, `hidway-update` + 5-minute timer
+  (build as an unprivileged user, unit tests gate, per-commit releases, atomic
+  switch, deferred while a session is live, auto-rollback on a failed health
+  check, pruning), udev rule `/dev/hidway-serial`, backups under
+  `/var/backups/hidway`. Service files run as root, so they are never changed
+  automatically (`--apply-system`). Docs: `docs/RELAY.md`.
+  Verified in a sandbox: unit tests incl. resync cases (ctest + `make check`),
+  serial reconnect/timeout/shutdown 13/13 (pty), rate cap exact,
+  install/update/rollback/uninstall 35/35 (fake root, local git server,
+  systemctl stand-in), shellcheck clean.
+  *Not yet run on the Pi (needs systemd + udev there).*
 
 ## Blocked on hardware / decision
 

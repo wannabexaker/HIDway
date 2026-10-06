@@ -13,6 +13,8 @@ out/
 *.exe
 *.pdb
 *.ilk
+relay/hidwayd
+relay/hidway_tests
 
 # IDE / tooling
 .vs/
@@ -30,6 +32,7 @@ __pycache__/
 *.local.ini
 hidway.ini
 hidwayd.conf
+update.conf
 *.key
 *.pem
 *.crt

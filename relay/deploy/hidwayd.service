@@ -1,0 +1,53 @@
+[Unit]
+Description=HIDway relay (UDP over Tailscale -> Pico serial link)
+Documentation=file:/opt/hidway/src/docs/RELAY.md
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Keep retrying forever (e.g. while Tailscale is still coming up).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hidway
+Group=hidway
+EnvironmentFile=/etc/hidway/hidwayd.conf
+ExecStart=/opt/hidway/current/hidwayd --bind ${HIDWAY_BIND} --allow ${HIDWAY_ALLOW} \
+    --port ${HIDWAY_PORT} --serial ${HIDWAY_SERIAL} --baud ${HIDWAY_BAUD} \
+    --state-file /run/hidway/state $HIDWAY_EXTRA_OPTS
+Restart=always
+RestartSec=1
+TimeoutStopSec=5
+RuntimeDirectory=hidway
+RuntimeDirectoryMode=0755
+
+# Low, bounded latency on a shared Pi; hidwayd sleeps in poll() when idle.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=20
+
+# Hardening: no privileges, read-only system, serial devices only.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-ttyACM rw
+DeviceAllow=char-ttyUSB rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

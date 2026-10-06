@@ -1,0 +1,3 @@
+# HIDway: stable name and group access for the Pi -> Pico serial link.
+# Raspberry Pi Debug Probe (VID 2e8a, PID 000c), CDC UART interface.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000c", GROUP="hidway", MODE="0660", SYMLINK+="hidway-serial"

@@ -260,7 +260,7 @@ static void test_protocol_input(void)
     hidway_input_encode(rel, &in);
     CHECK(hidway_input_decode(rel, sizeof rel, &out));
     CHECK(out.mods == 0 && out.buttons == 0);
-    for (int i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
+    for (size_t i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
         CHECK(out.keys[i] == 0);
 
     /* Rejections: wrong length, magic, version, type. */
@@ -394,6 +394,25 @@ static void test_serial(void)
         done = hidway_deframer_push(&d, frame[i], &got);
     CHECK(done);
 
+    /* A frame cut short (partial write), then the relay's resync delimiter:
+     * the fragment is dropped and the next full frame decodes. */
+    hidway_deframer_reset(&d);
+    for (size_t i = 0; i < n / 2; i++)
+        CHECK(!hidway_deframer_push(&d, frame[i], &got));
+    CHECK(!hidway_deframer_push(&d, 0x00, &got));
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done && got.seq == s.seq);
+
+    /* A bare delimiter (empty frame) is ignored. */
+    hidway_deframer_reset(&d);
+    CHECK(!hidway_deframer_push(&d, 0x00, &got));
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done);
+
     /* RELEASE normalizes to nothing held. */
     s.type = HIDWAY_SER_RELEASE;
     n = hidway_serial_build(&s, frame, sizeof frame);
@@ -402,7 +421,7 @@ static void test_serial(void)
     for (size_t i = 0; i < n; i++)
         done = hidway_deframer_push(&d, frame[i], &got);
     CHECK(done && got.mods == 0 && got.buttons == 0);
-    for (int i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
+    for (size_t i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
         CHECK(got.keys[i] == 0);
 }
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=HIDway relay updater
+Documentation=file:/opt/hidway/src/docs/RELAY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hidway-update --auto
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes
