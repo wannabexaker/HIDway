@@ -26,6 +26,10 @@ build‑it‑yourself networked KVM for keyboard and mouse.
                                                  └─────────────────────────┘
 ```
 
+<p align="center">
+  <img src="docs/images/client.png" alt="HIDway client while armed" width="460">
+</p>
+
 ## Why
 
 Some applications and games only accept input that arrives through a real
@@ -83,6 +87,13 @@ ctest --test-dir build --output-on-failure
 Built as part of the host build above (requires the MSVC toolchain). Output:
 `build/client/hidway-client.exe`. Copy `client/hidway.ini.example` to
 `hidway.ini` next to the executable and set your relay address.
+
+The client lives in the system tray while you play: grey = disarmed, green =
+armed and linked, red = link lost. Minimising sends it to the tray.
+
+`hidway-client.exe --preview` / `--preview-armed` render the UI with sample
+data and no network or input capture; add `--shot=out.bmp` to save a
+screenshot (used for the image above).
 
 ### Pico firmware
 
