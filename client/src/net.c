@@ -3,10 +3,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <bcrypt.h>
 
 #include <stdio.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 static SOCKET sock = INVALID_SOCKET;
 static LARGE_INTEGER perf_freq;
@@ -88,12 +90,38 @@ int hidway_net_recv(uint8_t *buf, size_t cap)
     return n;
 }
 
-uint32_t hidway_now_us(void)
+static uint64_t qpc_us(void)
 {
     LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
     if (perf_freq.QuadPart == 0)
-        return 0;
-    /* microseconds, truncated to 32 bits */
-    return (uint32_t)((t.QuadPart * 1000000ULL) / (unsigned long long)perf_freq.QuadPart);
+        QueryPerformanceFrequency(&perf_freq);
+    QueryPerformanceCounter(&t);
+    uint64_t q = (uint64_t)t.QuadPart, f = (uint64_t)perf_freq.QuadPart;
+    /* split so q * 1e6 cannot overflow, whatever the uptime */
+    return (q / f) * 1000000ull + (q % f) * 1000000ull / f;
+}
+
+uint32_t hidway_now_us(void)
+{
+    return (uint32_t)qpc_us(); /* microseconds, truncated to 32 bits */
+}
+
+uint64_t hidway_wall_us(void)
+{
+    static uint64_t base_wall, base_mono;
+    static int init;
+    if (!init) {
+        FILETIME ft;
+        GetSystemTimePreciseAsFileTime(&ft);
+        uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        base_wall = t100 / 10 - 11644473600000000ull; /* 1601 -> 1970, in us */
+        base_mono = qpc_us();
+        init = 1;
+    }
+    return base_wall + (qpc_us() - base_mono);
+}
+
+int hidway_random(uint8_t *p, size_t n)
+{
+    return BCryptGenRandom(NULL, p, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 ? 0 : -1;
 }

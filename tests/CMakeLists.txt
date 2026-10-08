@@ -6,9 +6,11 @@ add_executable(hidway_tests
     ${HIDWAY_COMMON}/crc16.c
     ${HIDWAY_COMMON}/cobs.c
     ${HIDWAY_COMMON}/serial.c
+    ${HIDWAY_COMMON}/hidway_crypto.c
 )
 
 target_include_directories(hidway_tests PRIVATE ${HIDWAY_COMMON})
+target_link_libraries(hidway_tests PRIVATE hidway_monocypher)
 
 if (MSVC)
     target_compile_options(hidway_tests PRIVATE /W4)

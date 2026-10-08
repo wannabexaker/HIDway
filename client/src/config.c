@@ -194,6 +194,9 @@ int hidway_config_load(const char *path, hidway_config_t *cfg)
             cfg->window_x = (int)strtol(val, NULL, 10);
         } else if (!strcmp(key, "window_y")) {
             cfg->window_y = (int)strtol(val, NULL, 10);
+        } else if (!strcmp(key, "key")) {
+            strncpy(cfg->key_hex, val, sizeof cfg->key_hex - 1);
+            cfg->key_hex[sizeof cfg->key_hex - 1] = 0;
         }
     }
     fclose(f);
@@ -219,6 +222,9 @@ int hidway_config_save(const char *path, const hidway_config_t *cfg)
         fprintf(f, "window_x = %d\n", cfg->window_x);
         fprintf(f, "window_y = %d\n", cfg->window_y);
     }
+    if (cfg->key_hex[0]) /* keep the end-to-end key across saves */
+        fprintf(f, "\n# End-to-end key, same as the relay's key file. Keep secret.\nkey = %s\n",
+                cfg->key_hex);
     fclose(f);
     return 1;
 }

@@ -14,9 +14,11 @@ CPPFLAGS += -I../common
 VERSION ?= $(shell git -C .. describe --always --dirty --tags 2>/dev/null || echo dev)
 CPPFLAGS += -DHIDWAY_VERSION='"$(VERSION)"'
 
-COMMON  = ../common/serial.c ../common/cobs.c ../common/crc16.c
+COMMON  = ../common/serial.c ../common/cobs.c ../common/crc16.c \
+          ../common/hidway_crypto.c ../common/vendor/monocypher/monocypher.c
 HEADERS = ../common/protocol.h ../common/hidway_kbd.h ../common/serial.h \
-          ../common/cobs.h ../common/crc16.h
+          ../common/cobs.h ../common/crc16.h ../common/hidway_crypto.h \
+          ../common/vendor/monocypher/monocypher.h
 
 TEST_SRC = ../tests/test_common.c ../common/hidway_kbd.c ../common/hidway_motion.c \
            ../common/keymap_sc2hid.c $(COMMON)

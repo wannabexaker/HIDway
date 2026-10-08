@@ -55,6 +55,18 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   cap exact, install/release/rollback/status/uninstall 43/43 (fake root,
   local git server, systemctl stand-in), shellcheck clean.
   *Not yet run on the Pi (needs systemd + udev there).*
+- [x] **17. Optional end-to-end encryption** (branch `feature/e2e-encryption`,
+  backup of the previous `main` at `backup/main-pre-encryption-2026-10-08`) —
+  `common/hidway_crypto`: sealed envelope with XChaCha20-Poly1305 (vendored
+  Monocypher 4.0.2, unmodified), random 24-byte nonce, timestamp-based replay
+  guard (strictly newer, ±2 min); client `key =` in hidway.ini, relay
+  `--key-file` / `--gen-key`; with a key plaintext is refused, without one
+  behaviour is unchanged; client E2E badge; `hidway-probe` tool. Verified:
+  host tests incl. the IETF XChaCha20-Poly1305 test vector (MSVC and gcc,
+  0 warnings); end-to-end against the Linux relay in a container: correct key
+  40/40 replies, plaintext and wrong key rejected, replay of an identical
+  packet rejected, key-less relay still serves plaintext clients.
+  *Not yet on the Pi.*
 
 ## Blocked on hardware / decision
 
@@ -68,6 +80,14 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   the line is public (→ one UDP port-forward to the Pi gives a direct Tailscale
   path, ~15–35 ms) or CGNAT (→ stay on relay / other options). Needs: Nova WAN
   IP check.
+- [!] **18. Low-latency path via Cloudflare Zero Trust (option 4)** — WARP
+  client on the remote PC (split tunnel: the relay only) → Cloudflare Tunnel
+  (`cloudflared` on the Pi) → `hidwayd` with E2E encryption on (item 17), so
+  Cloudflare sees only ciphertext. Needs: Zero Trust onboarding in the
+  Cloudflare dashboard (user action: team name, Free plan), a private-network
+  route to the Pi, relay bind/allow adjusted for traffic arriving via
+  `cloudflared`, then `hidway-probe` to compare RTT with the DERP path. Risk to
+  test: WARP and Tailscale coexisting on the same PC.
 
 ## Todo
 

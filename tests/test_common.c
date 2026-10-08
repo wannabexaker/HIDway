@@ -4,6 +4,7 @@
 
 #include "cobs.h"
 #include "crc16.h"
+#include "hidway_crypto.h"
 #include "hidway_kbd.h"
 #include "hidway_motion.h"
 #include "keymap_sc2hid.h"
@@ -425,6 +426,142 @@ static void test_serial(void)
         CHECK(got.keys[i] == 0);
 }
 
+/* ------------------------------------------------------------- crypto */
+
+#include "vendor/monocypher/monocypher.h"
+
+static int nib(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+static size_t unhex(const char *s, uint8_t *out, size_t cap)
+{
+    size_t n = 0;
+    for (; s[0] && s[1] && n < cap; s += 2) {
+        int hi = nib(s[0]), lo = nib(s[1]);
+        if (hi < 0 || lo < 0)
+            break;
+        out[n++] = (uint8_t)(hi << 4 | lo);
+    }
+    return n;
+}
+
+/* AEAD_XChaCha20_Poly1305 test vector, draft-irtf-cfrg-xchacha-03 A.3.1:
+ * proves the vendored Monocypher implements the standard construction. */
+static void test_xchacha_kat(void)
+{
+    const char *pt_s = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip "
+                       "for the future, sunscreen would be it.";
+    uint8_t key[32], nonce[24], ad[12], exp_ct[114], exp_tag[16], ct[114], tag[16], back[114];
+    CHECK(unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f", key, 32) == 32);
+    CHECK(unhex("404142434445464748494a4b4c4d4e4f5051525354555657", nonce, 24) == 24);
+    CHECK(unhex("50515253c0c1c2c3c4c5c6c7", ad, 12) == 12);
+    CHECK(unhex("bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb"
+                "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452"
+                "2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9"
+                "21f9664c97637da9768812f615c68b13b52e", exp_ct, 114) == 114);
+    CHECK(unhex("c0875924c1c7987947deafd8780acf49", exp_tag, 16) == 16);
+    CHECK(strlen(pt_s) == 114);
+
+    crypto_aead_lock(ct, tag, key, nonce, ad, sizeof ad, (const uint8_t *)pt_s, 114);
+    CHECK(memcmp(ct, exp_ct, 114) == 0);
+    CHECK(memcmp(tag, exp_tag, 16) == 0);
+    CHECK(crypto_aead_unlock(back, tag, key, nonce, ad, sizeof ad, ct, 114) == 0);
+    CHECK(memcmp(back, pt_s, 114) == 0);
+}
+
+static void test_seal_open(void)
+{
+    uint8_t key[HIDWAY_KEY_LEN], other[HIDWAY_KEY_LEN], nonce[HIDWAY_NONCE_LEN];
+    for (int i = 0; i < HIDWAY_KEY_LEN; i++) {
+        key[i] = (uint8_t)(i * 7 + 1);
+        other[i] = (uint8_t)(i * 7 + 2);
+    }
+    for (int i = 0; i < HIDWAY_NONCE_LEN; i++)
+        nonce[i] = (uint8_t)(0xA0 + i);
+
+    hidway_input_pkt_t in = {0}, back;
+    in.type = HIDWAY_MSG_STATE;
+    in.session_id = 0x01020304;
+    in.seq = 77;
+    hidway_bitmap_set(in.keys, 0x1A);
+    in.x = -1234;
+    uint8_t plain[HIDWAY_INPUT_PKT_LEN];
+    size_t pl = hidway_input_encode(plain, &in);
+
+    uint8_t env[HIDWAY_SEAL_MAX], out[HIDWAY_SEAL_MAX_INNER];
+    uint64_t ts = 0x0123456789ABCDEFull, ts_back = 0;
+    size_t el = hidway_seal(env, sizeof env, key, nonce, ts, plain, pl);
+    CHECK(el == pl + HIDWAY_SEAL_OVERHEAD);
+    CHECK(hidway_is_sealed(env, el));
+    /* plaintext must not appear on the wire */
+    CHECK(memcmp(env + HIDWAY_SEAL_HDR + HIDWAY_NONCE_LEN + HIDWAY_TS_LEN, plain, pl) != 0);
+    /* a sealed envelope is never mistaken for a plaintext packet */
+    CHECK(!hidway_input_decode(env, el, &back));
+
+    size_t ol = hidway_open(out, sizeof out, key, env, el, &ts_back);
+    CHECK(ol == pl && ts_back == ts);
+    CHECK(hidway_input_decode(out, ol, &back));
+    CHECK(back.seq == 77 && back.x == -1234 && hidway_bitmap_test(back.keys, 0x1A));
+
+    /* wrong key, and any single flipped bit anywhere, are rejected */
+    CHECK(hidway_open(out, sizeof out, other, env, el, NULL) == 0);
+    for (size_t i = 0; i < el; i++) {
+        env[i] ^= 0x01;
+        CHECK(hidway_open(out, sizeof out, key, env, el, NULL) == 0);
+        env[i] ^= 0x01;
+    }
+    CHECK(hidway_open(out, sizeof out, key, env, el, NULL) == pl);
+
+    /* truncation and garbage */
+    CHECK(hidway_open(out, sizeof out, key, env, el - 1, NULL) == 0);
+    CHECK(hidway_open(out, sizeof out, key, env, HIDWAY_SEAL_HDR, NULL) == 0);
+    CHECK(!hidway_is_sealed(plain, pl));
+
+    /* oversized inner packets are refused */
+    uint8_t big[HIDWAY_SEAL_MAX_INNER + 1] = {0};
+    CHECK(hidway_seal(env, sizeof env, key, nonce, 1, big, sizeof big) == 0);
+    CHECK(hidway_seal(env, 10, key, nonce, 1, plain, pl) == 0);
+}
+
+static void test_replay_guard(void)
+{
+    hidway_replay_t r = {0};
+    const uint64_t now = 1700000000000000ull, win = 120000000ull; /* 120 s */
+    CHECK(hidway_replay_accept(&r, now, now, win));
+    CHECK(!hidway_replay_accept(&r, now, now, win));        /* exact replay */
+    CHECK(!hidway_replay_accept(&r, now - 1, now, win));    /* older */
+    CHECK(hidway_replay_accept(&r, now + 1, now, win));     /* newer */
+    CHECK(!hidway_replay_accept(&r, now + win + 10, now, win)); /* future skew */
+    hidway_replay_t fresh = {0};
+    CHECK(!hidway_replay_accept(&fresh, now - win - 1, now, win)); /* stale after restart */
+    CHECK(hidway_replay_accept(&fresh, now - win + 1, now, win));
+}
+
+static void test_key_text(void)
+{
+    uint8_t k[HIDWAY_KEY_LEN], k2[HIDWAY_KEY_LEN];
+    char hex[2 * HIDWAY_KEY_LEN + 1];
+    for (int i = 0; i < HIDWAY_KEY_LEN; i++)
+        k[i] = (uint8_t)(255 - i * 3);
+    hidway_key_format(k, hex);
+    CHECK(strlen(hex) == 64);
+    CHECK(hidway_key_parse(hex, k2) && memcmp(k, k2, sizeof k) == 0);
+
+    char padded[80];
+    snprintf(padded, sizeof padded, "  %s \r\n", hex);
+    CHECK(hidway_key_parse(padded, k2) && memcmp(k, k2, sizeof k) == 0);
+
+    CHECK(!hidway_key_parse("abcd", k2));               /* too short */
+    hex[10] = 'x';
+    CHECK(!hidway_key_parse(hex, k2));                  /* not hex */
+    hidway_key_format(k, hex);
+    snprintf(padded, sizeof padded, "%sff", hex);
+    CHECK(!hidway_key_parse(padded, k2));               /* too long */
+    CHECK(!hidway_key_parse(NULL, k2));
+}
+
 int main(void)
 {
     test_bitmap();
@@ -441,6 +578,10 @@ int main(void)
     test_motion_give_back();
     test_motion_saturation();
     test_motion_wheel_limit_zero();
+    test_xchacha_kat();
+    test_seal_open();
+    test_replay_guard();
+    test_key_text();
 
     if (failures) {
         printf("%d check(s) failed\n", failures);

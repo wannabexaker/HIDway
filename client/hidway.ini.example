@@ -21,3 +21,8 @@ history_enabled = 1
 # Hotkeys: modifiers + one key, e.g. ctrl+shift+f12, ctrl+alt+shift+end.
 toggle_hotkey = ctrl+shift+f12
 panic_hotkey = ctrl+alt+shift+end
+
+# End-to-end encryption (optional): the same 64 hex characters as the relay's
+# key file (created with `hidwayd --gen-key`, see docs/RELAY.md). Keep secret.
+# With a key every packet is sealed; a malformed key stops all sending.
+# key = <64-hex-characters>

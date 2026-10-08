@@ -65,12 +65,16 @@ hide what it is. Use it where you are permitted to.
 | `client/`   | Remote PC (Windows) | Reads your keyboard/mouse (Raw Input), shows an arm/disarm UI, relays the state over UDP. |
 | `relay/`    | Raspberry Pi (Linux) | `hidwayd`: receives state, keeps the latest, forwards to the Pico, releases everything on link loss. |
 | `firmware/` | Raspberry Pi Pico / Pico W | Enumerates as a USB HID keyboard + mouse (TinyUSB). |
-| `common/`   | shared | Protocol, keyboard/mouse state logic, scan‑code→HID map. Pure C11, unit‑tested on the host. |
+| `common/`   | shared | Protocol, keyboard/mouse state logic, scan‑code→HID map, optional end‑to‑end encryption. Pure C11, unit‑tested on the host. |
+| `tools/probe/` | Remote PC (Windows) | `hidway-probe`: reachability and RTT to the relay without arming anything. |
 | `tests/`    | host | Unit tests for `common/` (ctest). |
 
 The transport uses [Tailscale](https://tailscale.com/) (WireGuard) so the HID
 endpoint is never exposed to the public internet and traffic is authenticated
-and encrypted end to end.
+and encrypted end to end. For paths that terminate encryption in the middle,
+HIDway can additionally seal every packet itself (XChaCha20‑Poly1305 with a
+pre‑shared key, replay‑protected); see
+[docs/RELAY.md](docs/RELAY.md#end-to-end-encryption-optional).
 
 ## Build
 

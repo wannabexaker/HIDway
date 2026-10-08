@@ -15,6 +15,13 @@
  * tty still holds an unsent frame, newer states replace the pending one
  * instead of queueing behind it. A RELEASE discards anything pending and is
  * always written.
+ *
+ * Encryption (optional): with --key-file the relay accepts only sealed
+ * envelopes (common/hidway_crypto.h, XChaCha20-Poly1305 with a pre-shared
+ * key), rejects replays by timestamp and seals its status replies, so a
+ * network path that terminates encryption (e.g. Cloudflare) sees only
+ * ciphertext. Without a key it speaks the plaintext protocol as before and
+ * ignores sealed packets.
  */
 #define _GNU_SOURCE /* cfmakeraw, CRTSCTS, getopt_long, clock_gettime */
 #include <arpa/inet.h>
@@ -29,11 +36,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "hidway_crypto.h"
 #include "protocol.h"
 #include "serial.h"
 
@@ -48,6 +58,11 @@
 #define POLL_PENDING_MS   1    /* a frame is waiting for the tty to drain */
 
 #define STATUS_FLAG_SERIAL_OPEN 0x0002
+#define STATUS_FLAG_ENCRYPTED   0x0004
+
+/* Sealed packets must be within this of the relay's wall clock (both ends run
+ * NTP); together with "strictly newer" it bounds replays after a restart. */
+#define REPLAY_WINDOW_US (120ull * 1000000ull)
 
 static volatile sig_atomic_t running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
@@ -57,6 +72,144 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint64_t wall_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* ------------------------------------------------------------- encryption */
+
+static struct {
+    bool on;
+    uint8_t key[HIDWAY_KEY_LEN];
+    hidway_replay_t replay;
+    bool warned_plain;  /* plaintext seen while encryption is required */
+    bool warned_sealed; /* sealed seen while no key is configured */
+    bool warned_skew;
+    uint32_t rejected;  /* forged, tampered, replayed or wrong-mode packets */
+} cry;
+
+static bool fill_random(uint8_t *p, size_t n)
+{
+    while (n) {
+        ssize_t r = getrandom(p, n, 0);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        p += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+static int gen_key(void)
+{
+    uint8_t k[HIDWAY_KEY_LEN];
+    char hex[2 * HIDWAY_KEY_LEN + 1];
+    if (!fill_random(k, sizeof k)) {
+        perror("getrandom");
+        return 1;
+    }
+    hidway_key_format(k, hex);
+    printf("%s\n", hex);
+    hidway_wipe(k, sizeof k);
+    hidway_wipe(hex, sizeof hex);
+    return 0;
+}
+
+static bool load_key_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "hidwayd: cannot read key file %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    /* root:hidway 0640 (service group may read) is the intended setup; warn
+     * about anything wider. */
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && (st.st_mode & 0037))
+        fprintf(stderr, "hidwayd: WARNING key file %s is writable by its group or readable by "
+                        "others (use chmod 640)\n", path);
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    bool ok = hidway_key_parse(buf, cry.key);
+    hidway_wipe(buf, sizeof buf);
+    if (!ok)
+        fprintf(stderr, "hidwayd: key file %s must hold exactly 64 hex characters\n", path);
+    return ok;
+}
+
+/* Turn a received datagram into an input packet, enforcing the configured
+ * mode: with a key only authentic, fresh, sealed packets pass. */
+static bool relay_decode(const uint8_t *buf, size_t n, hidway_input_pkt_t *p)
+{
+    if (!cry.on) {
+        if (hidway_is_sealed(buf, n)) {
+            if (!cry.warned_sealed) {
+                fprintf(stderr, "hidwayd: client sends encrypted packets but no --key-file is set\n");
+                cry.warned_sealed = true;
+            }
+            return false;
+        }
+        return hidway_input_decode(buf, n, p);
+    }
+
+    if (!hidway_is_sealed(buf, n)) {
+        if (!cry.warned_plain) {
+            fprintf(stderr, "hidwayd: plaintext packet rejected (encryption is required)\n");
+            cry.warned_plain = true;
+        }
+        cry.rejected++;
+        return false;
+    }
+    uint8_t inner[HIDWAY_SEAL_MAX_INNER];
+    uint64_t ts = 0;
+    size_t il = hidway_open(inner, sizeof inner, cry.key, buf, n, &ts);
+    if (!il) {
+        cry.rejected++; /* forged, tampered or sealed with another key */
+        return false;
+    }
+    uint64_t now = wall_us();
+    if (!hidway_replay_accept(&cry.replay, ts, now, REPLAY_WINDOW_US)) {
+        cry.rejected++;
+        long long skew_s = ((long long)ts - (long long)now) / 1000000;
+        if (!cry.warned_skew && (skew_s > 120 || skew_s < -120)) {
+            fprintf(stderr, "hidwayd: rejecting packets: client clock is %+lld s off "
+                            "(sync both clocks with NTP)\n", skew_s);
+            cry.warned_skew = true;
+        }
+        hidway_wipe(inner, sizeof inner);
+        return false;
+    }
+    cry.warned_skew = false;
+    bool ok = hidway_input_decode(inner, il, p);
+    hidway_wipe(inner, sizeof inner);
+    return ok;
+}
+
+static void send_status(int fd, const hidway_status_pkt_t *st, const struct sockaddr_in *to,
+                        socklen_t tolen)
+{
+    uint8_t sb[HIDWAY_STATUS_PKT_LEN];
+    size_t sl = hidway_status_encode(sb, st);
+    if (!cry.on) {
+        sendto(fd, sb, sl, 0, (const struct sockaddr *)to, tolen);
+        return;
+    }
+    uint8_t nonce[HIDWAY_NONCE_LEN], env[HIDWAY_SEAL_MAX];
+    if (!fill_random(nonce, sizeof nonce))
+        return;
+    size_t el = hidway_seal(env, sizeof env, cry.key, nonce, wall_us(), sb, sl);
+    if (el)
+        sendto(fd, env, el, 0, (const struct sockaddr *)to, tolen);
 }
 
 /* ------------------------------------------------------------ serial link */
@@ -236,6 +389,7 @@ static void write_state_file(const char *path, const relay_view_t *v, const seri
             HIDWAY_VERSION, (long)getpid(), (long long)v->started, v->link_up ? "up" : "down",
             !l->dev ? "none" : l->fd >= 0 ? "open" : "closed", l->dev ? l->dev : "",
             (long long)v->last_rx, v->pps, v->frames_ok, v->seq_gaps, v->rate_drops, l->replaced);
+    fprintf(f, "crypto=%s\ncrypto_rejected=%u\n", cry.on ? "on" : "off", cry.rejected);
     if (v->have_session)
         fprintf(f, "session=%08x\n", v->session);
     if (fclose(f) == 0)
@@ -301,8 +455,9 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--bind IP] [--allow IP] [--port N] [--serial DEV] [--baud N]\n"
-            "          [--state-file PATH] [--quiet] [--version]\n",
-            argv0);
+            "          [--state-file PATH] [--key-file PATH] [--quiet] [--version]\n"
+            "       %s --gen-key   print a new random 32-byte key (64 hex chars)\n",
+            argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -310,6 +465,7 @@ int main(int argc, char **argv)
     const char *bind_addr = "0.0.0.0";
     const char *allow_addr = NULL; /* if set, only accept this source IP */
     const char *state_path = NULL; /* if set, publish link/serial state here */
+    const char *key_path = NULL;   /* if set, require sealed packets */
     int port = 47800;
     int quiet = 0;
     serial_link_t ser = {.baud = 921600, .fd = -1};
@@ -321,12 +477,14 @@ int main(int argc, char **argv)
         {"serial", required_argument, 0, 's'},
         {"baud", required_argument, 0, 'B'},
         {"state-file", required_argument, 0, 'S'},
+        {"key-file", required_argument, 0, 'k'},
+        {"gen-key", no_argument, 0, 'G'},
         {"quiet", no_argument, 0, 'q'},
         {"version", no_argument, 0, 'V'},
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "b:a:p:s:B:S:qV", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "b:a:p:s:B:S:k:GqV", opts, NULL)) != -1) {
         switch (c) {
         case 'b': bind_addr = optarg; break;
         case 'a': allow_addr = optarg; break;
@@ -334,6 +492,8 @@ int main(int argc, char **argv)
         case 's': ser.dev = optarg; break;
         case 'B': ser.baud = atoi(optarg); break;
         case 'S': state_path = optarg; break;
+        case 'k': key_path = optarg; break;
+        case 'G': return gen_key();
         case 'q': quiet = 1; break;
         case 'V': printf("hidwayd %s\n", HIDWAY_VERSION); return 0;
         default: usage(argv[0]); return 2;
@@ -346,6 +506,11 @@ int main(int argc, char **argv)
     if (ser.dev && !baud_const(ser.baud)) {
         fprintf(stderr, "unsupported baud: %d\n", ser.baud);
         return 2;
+    }
+    if (key_path) {
+        if (!load_key_file(key_path))
+            return 2; /* never fall back to plaintext when a key was asked for */
+        cry.on = true;
     }
 
     signal(SIGINT, on_signal);
@@ -376,6 +541,8 @@ int main(int argc, char **argv)
             ser.dev ? ser.dev : "none (dump/echo mode)");
     if (!allow_addr)
         fprintf(stderr, "hidwayd: WARNING no --allow set, accepting any source\n");
+    fprintf(stderr, "hidwayd: encryption %s\n",
+            cry.on ? "ON (XChaCha20-Poly1305, sealed packets only)" : "off (plaintext protocol)");
 
     serial_open(&ser, now_ms());
 
@@ -425,8 +592,8 @@ int main(int argc, char **argv)
                 if (errno != EINTR) perror("recvfrom");
             } else if (allow_addr && from.sin_addr.s_addr != allow_in.s_addr) {
                 /* not our peer: drop silently */
-            } else if (!hidway_input_decode(buf, (size_t)n, &p)) {
-                /* malformed: drop */
+            } else if (!relay_decode(buf, (size_t)n, &p)) {
+                /* malformed, forged, replayed or wrong mode: drop */
             } else if (p.type != HIDWAY_MSG_RELEASE && !rate_allow(&rate, t)) {
                 /* over the sanity cap: drop (a RELEASE always passes) */
             } else if (p.type == HIDWAY_MSG_PROBE) {
@@ -438,10 +605,9 @@ int main(int argc, char **argv)
                 st.client_time_us = p.client_time_us;
                 st.frames_ok = frames_ok;
                 st.seq_gaps = seq_gaps;
-                st.flags = ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0;
-                uint8_t sb[HIDWAY_STATUS_PKT_LEN];
-                size_t sl = hidway_status_encode(sb, &st);
-                sendto(fd, sb, sl, 0, (struct sockaddr *)&from, fromlen);
+                st.flags = (ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0) |
+                           (cry.on ? STATUS_FLAG_ENCRYPTED : 0);
+                send_status(fd, &st, &from, fromlen);
             } else {
                 bool accept = true;
                 if (!have_session || p.session_id != session) {
@@ -483,11 +649,10 @@ int main(int argc, char **argv)
                     st.client_time_us = p.client_time_us;
                     st.frames_ok = frames_ok;
                     st.seq_gaps = seq_gaps;
-                    st.flags = ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0;
+                    st.flags = (ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0) |
+                               (cry.on ? STATUS_FLAG_ENCRYPTED : 0);
                     st.leds = 0;
-                    uint8_t sb[HIDWAY_STATUS_PKT_LEN];
-                    size_t sl = hidway_status_encode(sb, &st);
-                    sendto(fd, sb, sl, 0, (struct sockaddr *)&from, fromlen);
+                    send_status(fd, &st, &from, fromlen);
                 }
             }
         }
@@ -551,5 +716,6 @@ int main(int argc, char **argv)
     if (state_path)
         unlink(state_path);
     close(fd);
+    hidway_wipe(cry.key, sizeof cry.key);
     return 0;
 }

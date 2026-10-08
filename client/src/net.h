@@ -19,4 +19,12 @@ int hidway_net_recv(uint8_t *buf, size_t cap);
 /* Monotonic microsecond clock (wraps at 2^32, fine for RTT differences). */
 uint32_t hidway_now_us(void);
 
+/* Wall-clock microseconds since 1970 that never goes backwards in this
+ * process (startup wall time + monotonic elapsed time). Used as the sealed
+ * packet timestamp the relay checks for replays. */
+uint64_t hidway_wall_us(void);
+
+/* Fill `p` with cryptographically secure random bytes. Returns 0 on success. */
+int hidway_random(uint8_t *p, size_t n);
+
 #endif /* HIDWAY_CLIENT_NET_H */

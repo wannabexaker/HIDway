@@ -157,6 +157,36 @@ journalctl -u hidwayd -u hidway-update -f
 
 After a change: `sudo systemctl restart hidwayd`.
 
+### End-to-end encryption (optional)
+
+Tailscale already encrypts the path end to end. If the traffic takes a path
+that terminates encryption in the middle (for example Cloudflare WARP +
+Tunnel), turn on HIDway's own encryption so that path only ever sees
+ciphertext: every packet is sealed with XChaCha20-Poly1305 using a pre-shared
+32-byte key, and replays are rejected by timestamp. Both clocks must be in
+sync (NTP) within two minutes.
+
+```bash
+# on the Pi: create the key (readable by root and the service group only)
+sudo sh -c 'umask 027; /opt/hidway/current/hidwayd --gen-key > /etc/hidway/hidwayd.key'
+sudo chgrp hidway /etc/hidway/hidwayd.key
+sudo cat /etc/hidway/hidwayd.key          # copy this value to the client
+```
+
+1. In `/etc/hidway/hidwayd.conf` set
+   `HIDWAY_EXTRA_OPTS="--quiet --key-file /etc/hidway/hidwayd.key"` and
+   restart the relay.
+2. In the client's `hidway.ini` add `key = <the 64 hex characters>` and
+   restart the client. The CONNECTION card shows a green **E2E** badge.
+3. Check from the remote PC without arming anything:
+   `hidway-probe --ini hidway.ini` (it reports `relay: encryption on`).
+
+With a key, the relay accepts only sealed packets; without one it accepts only
+plaintext. A mismatch is logged on the relay and shows as "no reply" on the
+client. To turn encryption off again, remove `--key-file` and the `key` line.
+Never commit or paste the key anywhere public; rotate it by generating a new
+one on both ends.
+
 The udev rule covers the Raspberry Pi Debug Probe. For another USB-serial
 adapter, point `HIDWAY_SERIAL` at its `/dev/serial/by-id/...` path and give the
 `hidway` group access to it with a similar rule.
@@ -170,6 +200,7 @@ adapter, point `HIDWAY_SERIAL` at its `/dev/serial/by-id/...` path and give the
 | `/opt/hidway/current`, `previous` | Symlinks to the running and the previous release |
 | `/opt/hidway/update-status` | Outcome of the last update check |
 | `/etc/hidway/hidwayd.conf` | Relay settings (addresses, port, serial device) |
+| `/etc/hidway/hidwayd.key` | End-to-end key, if encryption is on (`root:hidway`, mode 0640) |
 | `/etc/hidway/update.conf` | Updater settings (repository, tags or branch, releases kept) |
 | `/etc/systemd/system/hidwayd.service` | The relay service |
 | `/etc/systemd/system/hidway-update.{service,timer}` | Daily release check |

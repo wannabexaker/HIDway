@@ -17,4 +17,11 @@ HIDWAY_SERIAL=/dev/hidway-serial
 HIDWAY_BAUD=921600
 
 # Extra options. Remove --quiet to log a once-per-second summary.
+#
+# End-to-end encryption (optional, recommended on any path that is not
+# Tailscale end to end): create a key once, give the client the same key
+# (`key = ...` in hidway.ini), then add --key-file below. See docs/RELAY.md.
+#   sudo sh -c 'umask 027; /opt/hidway/current/hidwayd --gen-key > /etc/hidway/hidwayd.key'
+#   sudo chgrp hidway /etc/hidway/hidwayd.key
+# HIDWAY_EXTRA_OPTS="--quiet --key-file /etc/hidway/hidwayd.key"
 HIDWAY_EXTRA_OPTS="--quiet"

@@ -38,6 +38,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "hidway_crypto.h"
 #include "hidway_kbd.h"
 #include "keymap_sc2hid.h"
 #include "net.h"
@@ -197,6 +198,10 @@ static struct {
     int probes_unanswered;
     int focus_id;
     int saved_flash;
+
+    int crypto_on;                /* a valid key is configured: seal everything */
+    int key_error;                /* a key is configured but invalid: send nothing */
+    uint8_t key[HIDWAY_KEY_LEN];
 
     UINT dpi;
     layout_t L;
@@ -470,7 +475,7 @@ static void history_add(char kind, const char *label)
 
 static void net_send_state(uint8_t type)
 {
-    if (!g.net_ok)
+    if (!g.net_ok || g.key_error)
         return;
     hidway_input_pkt_t p;
     memset(&p, 0, sizeof p);
@@ -493,19 +498,42 @@ static void net_send_state(uint8_t type)
     }
     uint8_t buf[HIDWAY_INPUT_PKT_LEN];
     size_t n = hidway_input_encode(buf, &p);
-    if (hidway_net_send(buf, n) > 0)
+    if (!g.crypto_on) {
+        if (hidway_net_send(buf, n) > 0)
+            g.sent_in_sec++;
+        return;
+    }
+    /* End-to-end: only ciphertext leaves this PC. */
+    uint8_t nonce[HIDWAY_NONCE_LEN], env[HIDWAY_SEAL_MAX];
+    if (hidway_random(nonce, sizeof nonce) != 0)
+        return; /* no randomness: send nothing rather than weaken the nonce */
+    size_t el = hidway_seal(env, sizeof env, g.key, nonce, hidway_wall_us(), buf, n);
+    hidway_wipe(buf, sizeof buf);
+    if (el && hidway_net_send(env, el) > 0)
         g.sent_in_sec++;
 }
 
 static void net_drain_status(void)
 {
-    uint8_t buf[64];
+    uint8_t buf[HIDWAY_SEAL_MAX + 16];
     for (int i = 0; i < 8; i++) {
         int n = hidway_net_recv(buf, sizeof buf);
         if (n <= 0)
             break;
+        const uint8_t *pkt = buf;
+        size_t len = (size_t)n;
+        uint8_t inner[HIDWAY_SEAL_MAX_INNER];
+        if (g.crypto_on) {
+            /* accept only authentic replies sealed with our key */
+            len = hidway_open(inner, sizeof inner, g.key, buf, (size_t)n, NULL);
+            if (!len)
+                continue;
+            pkt = inner;
+        } else if (hidway_is_sealed(buf, (size_t)n)) {
+            continue; /* relay has a key but we do not */
+        }
         hidway_status_pkt_t s;
-        if (!hidway_status_decode(buf, (size_t)n, &s) || s.session_id != g.session_id)
+        if (!hidway_status_decode(pkt, len, &s) || s.session_id != g.session_id)
             continue;
         g.status_seen = 1;
         g.ever_status = 1;
@@ -1021,10 +1049,20 @@ static void paint_stats(HDC dc)
     layout_t *L = &g.L;
     card(dc, L->stats, "CONNECTION");
 
+    /* end-to-end encryption badge next to the title */
+    int bx = L->stats.left + S(14) + tracked_w(dc, g.f_section, "CONNECTION") + S(10);
+    if (g.key_error)
+        chip(dc, bx, title_cy(L->stats), S(18), "KEY ERROR", C_DNG, C_DNG_BD, C_DNG_TX);
+    else if (g.crypto_on)
+        chip(dc, bx, title_cy(L->stats), S(18), "E2E", C_LIVE_F, C_LIVE_BD, C_LIVE_TX);
+    else
+        chip(dc, bx, title_cy(L->stats), S(18), "E2E OFF", C_FIELD, C_FIELD_BD, C_TEXT3);
+
     /* status on the right of the title row */
     COLORREF sc;
     const char *st;
-    if (!g.net_ok && !g.preview) { sc = C_WARN; st = "socket error"; }
+    if (g.key_error) { sc = C_WARN; st = "invalid key in hidway.ini"; }
+    else if (!g.net_ok && !g.preview) { sc = C_WARN; st = "socket error"; }
     else if (!g.armed) {
         if (link_recent()) { sc = C_LIVE; st = "relay reachable"; }
         else if (g.ever_status || g.probes_unanswered > 5) { sc = C_WARN; st = "no reply from relay"; }
@@ -1547,6 +1585,9 @@ static void resize_to_layout(HWND hwnd, const RECT *pos)
 static void preview_fill(void)
 {
     g.toggle_hk_ok = 1;
+    g.crypto_on = 1;
+    g.key_error = 0;
+    g.last_status_us = hidway_now_us();
     if (g.preview == 1) {
         g.ever_status = 1;
         g.rtt_ms = 91;
@@ -1799,6 +1840,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g.disp_y = g.cum_y;
                 g.disp_wheel = g.cum_wheel;
                 g.disp_pan = g.cum_pan;
+            } else {
+                g.last_status_us = hidway_now_us(); /* preview: link always fresh */
             }
             invalidate_readouts();
         } else if (wp == TIMER_NET) {
@@ -1883,9 +1926,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     hidway_config_load("hidway.ini", &g.cfg);
     if (g.preview) /* previews never show a real address */
         strcpy(g.cfg.target, "100.100.100.100");
+    if (g.cfg.key_hex[0]) {
+        /* A key was asked for: encrypt, or (if it is malformed) send nothing.
+         * Never fall back to plaintext. */
+        g.crypto_on = hidway_key_parse(g.cfg.key_hex, g.key);
+        g.key_error = !g.crypto_on;
+    }
     g.rtt_ms = -1;
-    srand(GetTickCount() ^ GetCurrentProcessId());
-    g.session_id = ((uint32_t)rand() << 17) ^ ((uint32_t)rand() << 3) ^ GetTickCount();
+    if (hidway_random((uint8_t *)&g.session_id, sizeof g.session_id) != 0) {
+        srand(GetTickCount() ^ GetCurrentProcessId());
+        g.session_id = ((uint32_t)rand() << 17) ^ ((uint32_t)rand() << 3) ^ GetTickCount();
+    }
 
     HW_GdiplusStartupInput gsi = {1, NULL, FALSE, FALSE};
     GdiplusStartup(&g.gdip, &gsi, NULL);
@@ -1938,5 +1989,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     }
     timeEndPeriod(1);
     GdiplusShutdown(g.gdip);
+    hidway_wipe(g.key, sizeof g.key);
+    hidway_wipe(g.cfg.key_hex, sizeof g.cfg.key_hex);
     return 0;
 }
