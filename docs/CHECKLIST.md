@@ -31,12 +31,9 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 - [x] **12c. Client UI rebuild** — per-monitor DPI aware, anti-aliased
   card/tile/chip design, dark scrollbar, readable hover/focus states,
   `--preview`/`--shot` for verified screenshots.
-- [!] **12d. Relay redeploy for PROBE** — `hidwayd` with PROBE support is
-  committed but not yet running on the Pi (SSH to the Pi was timing out over
-  the relayed Tailscale path). Until then the disarmed client shows
-  "no reply from relay"; armed mode works. Once item 16 is installed on the
-  Pi (one `install.sh` run), this and every later relay change deploy
-  automatically.
+- [x] **12d. Relay redeploy for PROBE** — resolved by item 16: the Pi runs
+  release `v0.1.0`, which includes PROBE support (checked 2026-10-24 with
+  `hidway-status`).
 
 - [x] **16. Relay as a managed service** — `hidwayd`: serial reopen with
   retry (probe unplug/replug), RELEASE on every new serial connection,
@@ -54,7 +51,9 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   (ctest + `make check`), serial reconnect/timeout/shutdown 13/13 (pty), rate
   cap exact, install/release/rollback/status/uninstall 43/43 (fake root,
   local git server, systemctl stand-in), shellcheck clean.
-  *Not yet run on the Pi (needs systemd + udev there).*
+  Installed on the Pi: `hidwayd` running release `v0.1.0` under systemd, daily
+  release check active, `hidway-status` reports only "serial device missing"
+  (expected until the Debug Probe is connected) — checked 2026-10-24.
 - [x] **17. Optional end-to-end encryption** (branch `feature/e2e-encryption`,
   backup of the previous `main` at `backup/main-pre-encryption-2026-10-08`) —
   `common/hidway_crypto`: sealed envelope with XChaCha20-Poly1305 (vendored
@@ -67,15 +66,23 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   40/40 replies, plaintext and wrong key rejected, replay of an identical
   packet rejected, key-less relay still serves plaintext clients.
   *Not yet on the Pi.*
+- [x] **7. T0 on-device test — GO** (2026-10-24) — T0 firmware built for a
+  Pico 2 (RP2350, `-DPICO_BOARD=pico2`) enumerated on Windows as "HID Keyboard
+  Device" + "HID-compliant mouse" with no driver install; holding BOOTSEL typed
+  `wwww` in Notepad, and in the target game the character walked forward and
+  the camera turned. The HID path is proven.
 
 ## Blocked on hardware / decision
 
-- [!] **7. T0 on-device test (GO/NO-GO)** — plug the Pico into the target,
-  confirm it is accepted as a real HID keyboard+mouse (and in the target app).
-  Needs: the Pico in hand. This gates everything else.
-- [!] **8. Serial link Pi ↔ Pico** — framing (COBS+CRC) from `hidwayd` to the
-  Pico, and the Pico applying state with a link-timeout release. Needs: a
-  Raspberry Pi Debug Probe (≈€12) or equivalent 3.3 V USB-serial.
+- [x] **8. Serial link Pi ↔ Pico** — framing (COBS+CRC) from `hidwayd` to the
+  Pico, and the Pico applying state with a link-timeout release. Chosen link:
+  the Pi 4's GPIO UART3 wired straight to the Pico (no adapter). Release
+  `v0.1.1` (udev rule + sandbox allow for `ttyAMA`) deployed on the Pi;
+  `dtoverlay uart3` loaded at runtime (no reboot, backup of the boot config
+  under `/var/backups/hidway/`); `hidway-status` OK with `/dev/hidway-serial
+  -> ttyAMA3` connected (2026-10-24). Link firmware built for the Pico 2.
+  `dtoverlay=uart3` added to `config.txt` (takes over at the next boot; boot
+  config backed up first).
 - [!] **9. Lower latency (direct path)** — decide from the Nova router whether
   the line is public (→ one UDP port-forward to the Pi gives a direct Tailscale
   path, ~15–35 ms) or CGNAT (→ stay on relay / other options). Needs: Nova WAN
@@ -91,11 +98,32 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 
 ## Todo
 
-- [!] **8b. On-hardware serial test** — flash the link firmware
-  (`-DHIDWAY_T0=OFF`), run `hidwayd --serial /dev/serial/by-id/...`, confirm the
-  target receives input end to end. Needs the Debug Probe + Pico.
-- [ ] **13. Local input handling for gaming** — so input goes to the target
-  only. (Design-sensitive; revisit carefully.)
+- [x] **8b. On-hardware serial test — end to end works** (2026-10-24) — link
+  firmware (`-DPICO_BOARD=pico2 -DHIDWAY_T0=OFF`) on the Pico 2, wired to the
+  Pi 4 UART3 over ~2 m; client → Tailscale (direct LAN path, probe 20/20, p50
+  4.5 ms) → relay v0.1.1 → Pico 2 → target: typing and mouse movement arrive
+  on the target. Open issue: input also acts on the local PC (item 13).
+- [x] **13. Input goes to the target only while armed** (2026-10-25) — capture
+  badge: always-on-top, holds the focus and the hidden, confined cursor while
+  armed; low-level keyboard hook on its own thread, installed on arm and
+  removed on disarm, so system shortcuts (Alt+Tab, Win, Ctrl+Shift+Esc, Alt+F4)
+  reach the target; Ctrl+Alt+Del / Win+L stay local and disarm; Ctrl+Alt+End
+  sends Ctrl+Alt+Del. Auto-disarm on focus loss (names the program that took
+  it), lock/logoff, display change, sleep, a missing hook, link loss. Mouse
+  Raw Input only while armed and only to the badge; injected input never
+  relayed; disarm reasons always listed. Disarmed, the badge is a small "Arm"
+  pill that never takes the focus (works over a full-screen AnyDesk window),
+  can be dragged and remembers its place; tray toggle. Also: RTT read on
+  arrival (was overstated by up to 400 ms while disarmed). Verified by the
+  user: typing, Ctrl, Alt+Tab reach the target only; click-to-arm works.
+- [x] **19. Status LEDs on the Pico** (2026-10-25) — red idle / blinking on a
+  link problem (stream stopped without RELEASE, corrupt frames, hang reboot),
+  green armed, yellow flash per mouse click, blue flash per key press; dark
+  when the target is off or asleep. Pins 21–25 (blue, yellow, GND, green, red).
+  Deframer counts dropped frames (unit-tested). Verified on the breadboard.
+- [ ] **20. Video with Sunshine + Moonlight** — lower-latency picture than
+  AnyDesk, with Sunshine's own keyboard/mouse input disabled so the target is
+  controlled by HIDway only.
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,
@@ -103,7 +131,12 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 
 ## Hardware
 
-- Raspberry Pi Pico W — **have**.
-- Raspberry Pi Debug Probe (or 3.3 V USB-serial) — **to get**.
+- Raspberry Pi Pico 2 — **have**; the HID device (T0 passed on it), on a
+  breadboard with 4 status LEDs, wired to the Pi 4 GPIO UART3.
+- 1 kΩ series resistors on the two UART lines — recommended before a
+  permanent (soldered) build.
+- Raspberry Pi Pico (RP2040) — **have**; can serve as the Pi↔Pico serial
+  link with the official `debugprobe` firmware instead of buying a Debug Probe.
+- Raspberry Pi Pico 2 W — **have**; spare.
 - Good micro-USB **data** cable; connect the Pico to a rear USB port on the
   target.

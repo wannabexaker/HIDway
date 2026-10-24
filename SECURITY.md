@@ -19,6 +19,12 @@ limits that to a single authenticated peer:
   plaintext is refused and neither end ever falls back to it.
 - **Relay (`hidwayd`):** binds to the Tailscale interface only and accepts
   packets from a single allow‑listed peer address. Unknown sources are dropped.
+- **Client:** reads input only while armed and only while its badge holds the
+  focus (mouse through Raw Input without background delivery, keyboard through
+  a low‑level hook installed on arm and removed on disarm). Input injected by
+  other software is never relayed. Losing the focus, locking the session, a
+  display change, sleep or a missing hook disarms. The recent‑input list is in
+  memory only.
 - **Fail‑safe:** loss of the client or link releases all keys and buttons
   within a bounded time; a stuck key is not a reachable state.
 - **Device:** the Pico enumerates as a standard HID device under its own

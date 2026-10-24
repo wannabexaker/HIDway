@@ -14,7 +14,7 @@ build‑it‑yourself networked KVM for keyboard and mouse.
 │  hidway-client  ─────┼───────────────────────▶│  hidwayd               │
 │  (reads your input)  │     (WireGuard)         │  (latest-state only)   │
 └──────────────────────┘                         └──────────┬────────────┘
-                                                            │ USB serial
+                                                            │ UART (GPIO or USB)
                                                  ┌──────────▼────────────┐
                                                  │  Raspberry Pi Pico      │
                                                  │  TinyUSB HID kbd+mouse  │
@@ -92,8 +92,20 @@ Built as part of the host build above (requires the MSVC toolchain). Output:
 `build/client/hidway-client.exe`. Copy `client/hidway.ini.example` to
 `hidway.ini` next to the executable and set your relay address.
 
-The client lives in the system tray while you play: grey = disarmed, green =
-armed and linked, red = link lost. Minimising sends it to the tray.
+While **armed**, your keyboard and mouse act on the target only: a small badge
+at the top of the screen holds the focus and the hidden cursor, and system
+shortcuts (Alt+Tab, Win, Ctrl+Shift+Esc, Alt+F4, …) go to the target too.
+Ctrl+Alt+Del and Win+L are reserved by Windows and stay on this PC; use
+Ctrl+Alt+End for Ctrl+Alt+Del on the target. Arm by clicking the badge (it
+sits over a full-screen remote-desktop or streaming window without taking the
+focus, and can be dragged anywhere) or with Ctrl+Shift+F12; the same hotkey
+disarms. Anything that takes the focus away, locks the PC, changes the display
+or drops the link disarms automatically and releases everything on the
+target. Nothing is read while disarmed, and input injected by software on this
+PC is never relayed.
+
+The client also lives in the system tray: grey = disarmed, green = armed and
+linked, red = link lost. Minimising sends it to the tray.
 
 `hidway-client.exe --preview` / `--preview-armed` render the UI with sample
 data and no network or input capture; add `--shot=out.bmp` to save a
@@ -105,12 +117,26 @@ Requires the [Pico SDK](https://github.com/raspberrypi/pico-sdk) and the Arm
 GNU toolchain.
 
 ```bash
-cmake -S firmware -B build/firmware -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S firmware -B build/firmware -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPICO_BOARD=pico2 -DHIDWAY_T0=OFF
 cmake --build build/firmware
 # flash build/firmware/hidway_fw.uf2 via BOOTSEL
 ```
 
+`PICO_BOARD` is `pico`, `pico_w`, `pico2` or `pico2_w`. `HIDWAY_T0=ON` (the
+default) builds a stand-alone test mode instead of the relay link: holding
+BOOTSEL holds W and moves the mouse, to check that a target accepts the device.
 On Windows, `tools/build.ps1` builds both the firmware and the host tests.
+
+Optional status LEDs, each through a series resistor (330 Ω; 100 Ω for blue):
+
+| Pico pin | LED | Meaning |
+|---|---|---|
+| 21 (GP16) | blue | flashes on every key press |
+| 22 (GP17) | yellow | flashes on every mouse button press |
+| 23 | GND | common return |
+| 24 (GP18) | green | armed: input arriving |
+| 25 (GP19) | red | on: connected, idle · blinking: link problem · off: target off or asleep |
 
 ### Relay (`hidwayd`) on the Raspberry Pi
 

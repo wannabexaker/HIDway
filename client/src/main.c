@@ -1,15 +1,14 @@
 /*
  * HIDway client - remote PC interface.
  *
- * A visible window with an ARM/DISARM switch. While ARMED it reads this PC's
- * own keyboard and mouse through Raw Input and relays the COMPLETE current
- * state to the Raspberry Pi over UDP (through Tailscale) at a steady rate plus
- * on every change. It never sends event streams, so a lost packet self-
- * corrects and a key can never stick.
+ * A visible window with an ARM/DISARM switch. While ARMED it relays the
+ * COMPLETE current state of this PC's physical keyboard and mouse to the
+ * Raspberry Pi over UDP (through Tailscale) at a steady rate. It never sends
+ * event streams, so a lost packet self-corrects and a key can never stick.
  *
- * It does not block local input (Raw Input without RIDEV_NOLEGACY): while
- * ARMED, keys still reach the focused app on this PC too. Local input blocking
- * is a separate, later step.
+ * While ARMED the input goes to the target only (see "Input capture"): a
+ * small badge holds the focus and the cursor, and system shortcuts are taken
+ * over too. Nothing is read while disarmed.
  *
  * The on-screen "recent input" list is in memory only, never written to disk,
  * and cleared on exit.
@@ -28,7 +27,9 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <timeapi.h>
+#include <shellscalingapi.h>
 #include <uxtheme.h>
+#include <wtsapi32.h>
 
 #include <ctype.h>
 #include <limits.h>
@@ -48,6 +49,8 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shcore.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 /* ---- DWM attributes (Windows 11) ---------------------------------------- */
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -102,12 +105,17 @@ int WINAPI GdipDrawLines(void *graphics, void *pen, const HW_PointF *points, int
 #define LINK_RECENT_US 900000u
 #define HISTORY_MAX 80
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_CAPTURE_KEY (WM_APP + 2) /* from the hook thread: wp vk, lp scan | KEYF_* */
+#define WM_NET_READ (WM_APP + 3)    /* a relay reply is waiting */
+#define KEYF_E0 0x10000
+#define KEYF_UP 0x20000
+#define BADGE_FADE_MS 2500u
 #define WIN_STYLE (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN)
 
 enum {
     ID_HISTORY = 1001, ID_CLEAR, ID_TARGET, ID_PORT, ID_RATE, ID_AUTO,
     ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_SAVE, ID_ARM, ID_PANIC,
-    IDM_ARM, IDM_PANIC, IDM_SHOW, IDM_QUIT
+    IDM_ARM, IDM_PANIC, IDM_SHOW, IDM_BADGE, IDM_QUIT
 };
 
 enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
@@ -218,6 +226,24 @@ static struct {
     int tray_shown;
     HICON ic_grey, ic_green, ic_red;
     int cur_icon;
+
+    /* input capture while armed */
+    HWND badge;
+    UINT badge_dpi;
+    HFONT bf_main, bf_hint;
+    BYTE badge_alpha;
+    COLORREF badge_border;
+    int badge_layout_armed;
+    char badge_text[64];
+    int badge_hover, badge_pressed, badge_drag;
+    POINT drag_pt;
+    RECT drag_rc;
+    HWND prev_fg;
+    POINT cursor_home;
+    HANDLE hook_thread;
+    DWORD hook_tid;
+    volatile LONG hook_ok;
+    int end_as_del;
 } g;
 
 static int S(int v)
@@ -456,7 +482,9 @@ static void hotkey_pretty(const char *text, char *out, size_t cap)
 /* kind: 'd' key/button down, 'u' up, 'i' info, 'w' warning */
 static void history_add(char kind, const char *label)
 {
-    if (!g.cfg.history_enabled || !g.history)
+    /* The setting covers input only; arm/disarm events and their reasons
+     * are always listed. */
+    if (!g.history || (!g.cfg.history_enabled && (kind == 'd' || kind == 'u')))
         return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -735,12 +763,373 @@ static int net_interval_ms(void)
     return ms < 1 ? 1 : ms;
 }
 
+/*
+ * While ARMED this PC's input goes to the target only. A small always-on-top
+ * badge takes the focus, the cursor is hidden and confined to it, and a
+ * low-level keyboard hook - installed only while armed, on its own thread -
+ * consumes every physical key while the badge is in front, so system
+ * shortcuts (Alt+Tab, Win, Ctrl+Shift+Esc, Alt+F4, ...) reach the target
+ * instead of this PC. Ctrl+Alt+Del and Win+L are reserved by Windows: they
+ * stay on this PC and disarm. Input injected by software on this PC is never
+ * relayed, and nothing at all is read while disarmed.
+ *
+ * Anything that takes the focus away (another window, the lock or secure
+ * screen, a display change, sleep, the hook going missing) disarms, which
+ * releases everything on the target.
+ */
+#ifndef LLKHF_LOWER_IL_INJECTED
+#define LLKHF_LOWER_IL_INJECTED 0x02
+#endif
+
+/* Shared with the hook thread. */
+static volatile LONG cap_active; /* armed and the badge holds the focus */
+static HWND volatile cap_badge;
+static uint8_t cap_ours[256]; /* hook thread only: key downs it consumed, by vk */
+
+static LRESULT CALLBACK capture_hook(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION) {
+        const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
+        BYTE vk = (BYTE)k->vkCode;
+        BOOL up = (k->flags & LLKHF_UP) != 0;
+        if (!(k->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) && cap_active &&
+            GetForegroundWindow() == cap_badge && (!up || cap_ours[vk])) {
+            cap_ours[vk] = (uint8_t)!up;
+            LPARAM info = (LPARAM)((k->scanCode & 0xFFFFu) | ((k->flags & LLKHF_EXTENDED) ? KEYF_E0 : 0) |
+                                   (up ? KEYF_UP : 0));
+            PostMessageA(cap_badge, WM_CAPTURE_KEY, (WPARAM)k->vkCode, info);
+            return 1; /* consumed: this PC never sees the key */
+        }
+        /* Not ours, or the release of a key held down before arming: this PC
+         * must see that, or the key would stay down here. */
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+static DWORD WINAPI capture_hook_thread(LPVOID ready)
+{
+    MSG m;
+    PeekMessageA(&m, NULL, WM_USER, WM_USER, PM_NOREMOVE); /* create the message queue */
+    HHOOK h = SetWindowsHookExA(WH_KEYBOARD_LL, capture_hook, GetModuleHandleA(NULL), 0);
+    InterlockedExchange(&g.hook_ok, h != NULL);
+    SetEvent((HANDLE)ready);
+    if (!h)
+        return 1;
+    while (GetMessageA(&m, NULL, 0, 0) > 0) {
+    }
+    UnhookWindowsHookEx(h);
+    return 0;
+}
+
+static void hook_stop(void)
+{
+    if (!g.hook_thread)
+        return;
+    PostThreadMessageA(g.hook_tid, WM_QUIT, 0, 0);
+    WaitForSingleObject(g.hook_thread, 1000);
+    CloseHandle(g.hook_thread);
+    g.hook_thread = NULL;
+}
+
+static int hook_start(void)
+{
+    memset(cap_ours, 0, sizeof cap_ours);
+    HANDLE ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!ready)
+        return 0;
+    InterlockedExchange(&g.hook_ok, 0);
+    g.hook_thread = CreateThread(NULL, 0, capture_hook_thread, ready, 0, &g.hook_tid);
+    if (g.hook_thread) {
+        SetThreadPriority(g.hook_thread, THREAD_PRIORITY_HIGHEST);
+        WaitForSingleObject(ready, 2000);
+    }
+    CloseHandle(ready);
+    if (!g.hook_ok) {
+        hook_stop();
+        return 0;
+    }
+    return 1;
+}
+
+/* Mouse Raw Input only while armed and only for the badge (no INPUTSINK):
+ * nothing is read while disarmed or while another window is in front. The
+ * keyboard comes from the hook. */
+static int raw_input_to(HWND target)
+{
+    RAWINPUTDEVICE d = {0x01, 0x02, target ? 0 : RIDEV_REMOVE, target};
+    return RegisterRawInputDevices(&d, 1, sizeof d) ? 1 : 0;
+}
+
+/* ---- badge ---------------------------------------------------------------- */
+
+static int BS(int v)
+{
+    return MulDiv(v, (int)g.badge_dpi, 96);
+}
+
+static HFONT badge_font(int tenths_px, int weight)
+{
+    return CreateFontA(-MulDiv(tenths_px, (int)g.badge_dpi, 960), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                       "Segoe UI Variable Text");
+}
+
+/* Main text, hint and dot colour for the current state. */
+static COLORREF badge_texts(char *st, size_t st_cap, char *hint, size_t hint_cap)
+{
+    char hk[48];
+    hotkey_pretty(g.cfg.toggle.text, hk, sizeof hk);
+    if (!g.armed) { /* a small "Arm" pill; no hint, to keep it out of the way */
+        hint[0] = 0;
+        (void)hint_cap;
+        snprintf(st, st_cap, link_recent() ? "Arm" : "Offline");
+        return link_recent() ? C_TEXT3 : C_WARN;
+    }
+    snprintf(hint, hint_cap, "%s to release", hk);
+    if (!link_recent()) {
+        snprintf(st, st_cap, "ARMED  ·  no link");
+        return C_WARN;
+    }
+    snprintf(st, st_cap, "ARMED  ·  %d ms", g.rtt_ms);
+    return C_LIVE;
+}
+
+/* Size the badge for the monitor it is on and keep it there: centred on
+ * badge_x with its top at badge_y, or at the top centre of the main window's
+ * monitor until the user drags it somewhere. */
+static void badge_layout(void)
+{
+    POINT at = {g.cfg.badge_x, g.cfg.badge_y};
+    HMONITOR mon = at.x != INT_MIN && at.y != INT_MIN ? MonitorFromPoint(at, MONITOR_DEFAULTTONULL) : NULL;
+    MONITORINFO mi = {sizeof mi};
+    int placed = mon != NULL; /* else unset, or that monitor is gone */
+    if (!placed)
+        mon = MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoA(mon, &mi);
+    UINT dx = 96, dy = 96;
+    if (FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy)))
+        dx = 96;
+    g.badge_dpi = dx;
+
+    if (g.bf_main) DeleteObject(g.bf_main);
+    if (g.bf_hint) DeleteObject(g.bf_hint);
+    g.bf_main = badge_font(110, FW_SEMIBOLD);
+    g.bf_hint = badge_font(100, FW_NORMAL);
+
+    /* Disarmed: a small pill wide enough for "Offline". Armed: room for the
+     * widest status and the release hint. */
+    g.badge_layout_armed = g.armed;
+    HDC dc = GetDC(g.badge);
+    int w, h;
+    if (g.armed) {
+        char hk[48], hint[64];
+        hotkey_pretty(g.cfg.toggle.text, hk, sizeof hk);
+        snprintf(hint, sizeof hint, "%s to release", hk);
+        w = BS(25) + text_w(dc, g.bf_main, "ARMED  ·  9999 ms") + BS(18) + text_w(dc, g.bf_hint, hint) + BS(12);
+        h = BS(28);
+    } else {
+        w = BS(21) + text_w(dc, g.bf_main, "Offline") + BS(10);
+        h = BS(22);
+    }
+    ReleaseDC(g.badge, dc);
+
+    if (!placed) {
+        at.x = (mi.rcMonitor.left + mi.rcMonitor.right) / 2;
+        at.y = mi.rcMonitor.top + BS(10);
+    }
+    int x = at.x - w / 2, y = at.y;
+    if (x + w > mi.rcMonitor.right) x = mi.rcMonitor.right - w;
+    if (x < mi.rcMonitor.left) x = mi.rcMonitor.left;
+    if (y + h > mi.rcMonitor.bottom) y = mi.rcMonitor.bottom - h;
+    if (y < mi.rcMonitor.top) y = mi.rcMonitor.top;
+    SetWindowPos(g.badge, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+}
+
+/* After a drag: remember where the user put it, and resize for that monitor. */
+static void badge_remember_position(void)
+{
+    RECT r;
+    GetWindowRect(g.badge, &r);
+    g.cfg.badge_x = (r.left + r.right) / 2;
+    g.cfg.badge_y = r.top;
+    if (!g.preview)
+        hidway_config_save("hidway.ini", &g.cfg);
+    badge_layout();
+}
+
+static void badge_paint(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bm = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+    HGDIOBJ ob = SelectObject(mem, bm);
+
+    fill_solid(mem, rc, g.badge_hover && !g.armed ? C_TILE : C_CARD);
+    char st[48], hint[64];
+    COLORREF c = badge_texts(st, sizeof st, hint, sizeof hint);
+    int cy = rc.bottom / 2;
+    if (g.armed) {
+        dot(mem, BS(14), cy, BS(4), c);
+        text_vc(mem, g.bf_main, C_TEXT, BS(25), cy, st);
+        RECT hr = {0, 0, rc.right - BS(12), rc.bottom};
+        text_in(mem, g.bf_hint, C_TEXT3, hr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, hint);
+    } else {
+        dot(mem, BS(11), cy, BS(3), c);
+        text_vc(mem, g.bf_main, g.badge_hover ? C_TEXT : C_TEXT2, BS(20), cy, st);
+    }
+
+    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, ob);
+    DeleteObject(bm);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+static void badge_set_alpha(BYTE a)
+{
+    if (a != g.badge_alpha) {
+        g.badge_alpha = a;
+        SetLayeredWindowAttributes(g.badge, 0, a, LWA_ALPHA);
+    }
+}
+
+/* Visibility, text, border and fade for the current state. Cheap: called on
+ * every UI tick and every state change. */
+static void badge_refresh(void)
+{
+    if (!g.badge)
+        return;
+    int show = !g.shot_path[0] && (g.armed || g.cfg.badge);
+    if (show != (IsWindowVisible(g.badge) != 0))
+        ShowWindow(g.badge, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (!show)
+        return;
+    if (g.armed != g.badge_layout_armed)
+        badge_layout(); /* the two states have different sizes */
+
+    char st[48], hint[64], key[64];
+    badge_texts(st, sizeof st, hint, sizeof hint);
+    snprintf(key, sizeof key, "%d%d%s", g.armed, g.badge_hover, st);
+    if (strcmp(key, g.badge_text) != 0) {
+        strcpy(g.badge_text, key);
+        InvalidateRect(g.badge, NULL, FALSE);
+    }
+
+    BYTE a;
+    if (g.armed)
+        a = timeGetTime() - g.armed_at_ms > BADGE_FADE_MS && link_recent() ? 120 : 240;
+    else
+        a = g.badge_hover || g.badge_drag ? 240 : 150;
+    badge_set_alpha(a);
+
+    COLORREF bd = g.armed ? C_LIVE_BD : C_CARD_BD;
+    if (bd != g.badge_border) {
+        g.badge_border = bd;
+        DwmSetWindowAttribute(g.badge, HW_DWMWA_BORDER, &bd, sizeof bd);
+    }
+}
+
+static void confine_cursor(void)
+{
+    RECT r;
+    GetWindowRect(g.badge, &r);
+    InflateRect(&r, -BS(4), -BS(4));
+    ClipCursor(&r);
+}
+
+/* ---- arm / disarm ---------------------------------------------------------- */
+
+static int capture_start(void)
+{
+    HWND fg = GetForegroundWindow();
+    g.prev_fg = fg != g.badge ? fg : NULL;
+    GetCursorPos(&g.cursor_home);
+    badge_layout();
+
+    if (g.cfg.relay_keyboard && !hook_start())
+        return 0;
+    ShowWindow(g.badge, SW_SHOW);
+    SetForegroundWindow(g.badge);
+    SetFocus(g.badge);
+    if (GetForegroundWindow() != g.badge || !raw_input_to(g.badge)) {
+        hook_stop();
+        return 0;
+    }
+    confine_cursor();
+    InterlockedExchange(&cap_active, 1);
+    /* Keys pressed while the badge was taking the focus are not the hook's;
+     * drop them so they are not mistaken for a missing hook. */
+    MSG m;
+    while (PeekMessageA(&m, g.badge, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) {
+    }
+    return 1;
+}
+
+static void capture_stop(void)
+{
+    InterlockedExchange(&cap_active, 0);
+    hook_stop();
+    raw_input_to(NULL);
+    ClipCursor(NULL);
+    /* Back to where the user was, unless something else took the focus. */
+    if (GetForegroundWindow() == g.badge && g.prev_fg && IsWindow(g.prev_fg))
+        SetForegroundWindow(g.prev_fg);
+    SetCursorPos(g.cursor_home.x, g.cursor_home.y);
+    g.prev_fg = NULL;
+}
+
+/* Disarm because another window took the focus, naming its program. */
+static void focus_lost(HWND to)
+{
+    char msg[128] = "Focus lost - auto-disarmed";
+    if (!to)
+        to = GetForegroundWindow();
+    DWORD pid = 0;
+    if (to)
+        GetWindowThreadProcessId(to, &pid);
+    HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (p) {
+        char path[MAX_PATH];
+        DWORD n = sizeof path;
+        if (QueryFullProcessImageNameA(p, 0, path, &n)) {
+            const char *base = strrchr(path, '\\');
+            snprintf(msg, sizeof msg, "Focus lost to %s - auto-disarmed", base ? base + 1 : path);
+        }
+        CloseHandle(p);
+    } else if (!to) {
+        snprintf(msg, sizeof msg, "Focus lost (lock or secure screen) - auto-disarmed");
+    }
+    set_armed(0);
+    history_add('w', msg);
+}
+
+/* Every UI tick while armed: the focus is still ours and the cursor stays
+ * confined. */
+static void capture_tick(void)
+{
+    if (GetForegroundWindow() != g.badge) {
+        focus_lost(NULL);
+        return;
+    }
+    confine_cursor();
+}
+
 static void set_armed(int on)
 {
     if (on == g.armed)
         return;
+    if (on && !g.preview && !capture_start()) {
+        history_add('w', "Could not take the input focus - not armed");
+        tray_balloon("HIDway", "Could not take the input focus. Click the HIDway window, then arm again.");
+        badge_refresh();
+        return;
+    }
     g.armed = on;
     clear_relay_state();
+    g.end_as_del = 0;
 
     if (on) {
         g.sec_start_us = hidway_now_us();
@@ -749,8 +1138,10 @@ static void set_armed(int on)
         g.armed_at_ms = timeGetTime();
         net_send_state(HIDWAY_MSG_STATE);
         SetTimer(g.hwnd, TIMER_NET, net_interval_ms(), NULL);
-        history_add('i', "Armed");
+        history_add('i', "Armed - input goes to the target only");
     } else {
+        if (!g.preview)
+            capture_stop();
         for (int i = 0; i < 3; i++)
             net_send_state(HIDWAY_MSG_RELEASE);
         KillTimer(g.hwnd, TIMER_NET);
@@ -760,16 +1151,26 @@ static void set_armed(int on)
     InvalidateRect(g.arm, NULL, FALSE);
     invalidate_readouts();
     tray_update();
+    badge_refresh();
+    if (g.armed && !g.preview)
+        confine_cursor(); /* to the badge at its armed size */
 }
 
-static void on_raw_keyboard(const RAWKEYBOARD *kb)
+static void apply_usage(uint8_t usage, bool up)
 {
-    if (!g.armed || !g.cfg.relay_keyboard || kb->MakeCode == 0 || kb->MakeCode == 0xFF)
+    if (!usage)
         return;
-    bool e0 = (kb->Flags & RI_KEY_E0) != 0;
-    bool up = (kb->Flags & RI_KEY_BREAK) != 0;
-    uint8_t sc = (uint8_t)kb->MakeCode;
+    bool was = hidway_bitmap_test(g.keys, usage);
+    if (up) hidway_bitmap_clear(g.keys, usage); else hidway_bitmap_set(g.keys, usage);
+    if (was != !up) {
+        char tmp[8];
+        history_add(up ? 'u' : 'd', hidway_usage_name(usage, tmp));
+    }
+}
 
+/* One key edge as a Set-1 scan code. */
+static void apply_key(uint8_t sc, bool e0, bool up)
+{
     uint8_t mod = hidway_sc_to_modifier(sc, e0);
     if (mod) {
         bool was = (g.modifiers & mod) != 0;
@@ -780,14 +1181,77 @@ static void on_raw_keyboard(const RAWKEYBOARD *kb)
                     history_add(up ? 'u' : 'd', MODS[i].name);
         return;
     }
-    uint8_t usage = hidway_sc_to_usage(sc, e0);
-    if (!usage)
+    apply_usage(hidway_sc_to_usage(sc, e0), up);
+}
+
+static unsigned held_mods(void)
+{
+    unsigned m = 0;
+    if (g.modifiers & 0x11) m |= MOD_CONTROL;
+    if (g.modifiers & 0x22) m |= MOD_SHIFT;
+    if (g.modifiers & 0x44) m |= MOD_ALT;
+    if (g.modifiers & 0x88) m |= MOD_WIN;
+    return m;
+}
+
+/* A key consumed by the capture hook (keyboard relay on). */
+static void on_capture_key(UINT vk, LPARAM info)
+{
+    if (!g.armed)
+        return; /* queued before a disarm: the target is already released */
+    bool up = (info & KEYF_UP) != 0;
+    bool e0 = (info & KEYF_E0) != 0;
+    unsigned sc = (unsigned)(info & 0xFFFF);
+    unsigned mods = held_mods();
+
+    if (!up) {
+        if (g.cfg.panic.vk && vk == g.cfg.panic.vk && mods == g.cfg.panic.mods) {
+            set_armed(0);
+            history_add('w', "PANIC - all released");
+            return;
+        }
+        if (vk == g.cfg.toggle.vk && mods == g.cfg.toggle.mods) {
+            set_armed(0);
+            return;
+        }
+        /* Windows keeps Ctrl+Alt+Del and Win+L for itself; they act on this
+         * PC, so never pass them on and release the target. */
+        if ((vk == VK_DELETE && (mods & MOD_CONTROL) && (mods & MOD_ALT)) || (vk == 'L' && (mods & MOD_WIN))) {
+            set_armed(0);
+            history_add('w', "Reserved shortcut - disarmed");
+            return;
+        }
+    }
+    /* Ctrl+Alt+End is Ctrl+Alt+Del on the target, as in Remote Desktop. */
+    if (vk == VK_END && (g.end_as_del || (!up && (mods & MOD_CONTROL) && (mods & MOD_ALT)))) {
+        g.end_as_del = !up;
+        apply_usage(0x4C, up); /* Delete */
         return;
-    bool was = hidway_bitmap_test(g.keys, usage);
-    if (up) hidway_bitmap_clear(g.keys, usage); else hidway_bitmap_set(g.keys, usage);
-    if (was != !up) {
-        char tmp[8];
-        history_add(up ? 'u' : 'd', hidway_usage_name(usage, tmp));
+    }
+    /* Keys whose hook scan codes do not follow the Set-1 table. */
+    if (vk == VK_PAUSE || vk == VK_NUMLOCK || vk == VK_SNAPSHOT) {
+        apply_usage(vk == VK_PAUSE ? 0x48 : vk == VK_NUMLOCK ? 0x53 : 0x46, up);
+        return;
+    }
+    if (vk == VK_RSHIFT)
+        e0 = false; /* RShift has its own code; the hook may flag it extended */
+    if (sc == 0 || sc > 0xFF)
+        return; /* synthesized by the keyboard layout, e.g. the LCtrl of AltGr */
+    apply_key((uint8_t)sc, e0, up);
+}
+
+/* While armed the hook consumes every physical key press, so a key press
+ * that still reaches the badge as a window message means the hook is gone
+ * (Windows drops hooks it considers unresponsive): stop instead of letting
+ * keys act on this PC. A key injected by software also lands here; stopping
+ * is then the safe side too. */
+static void on_badge_keydown(WPARAM vk)
+{
+    if (g.armed && g.hook_thread) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "Key capture stopped (vk %02X) - auto-disarmed", (unsigned)vk);
+        set_armed(0);
+        history_add('w', msg);
     }
 }
 
@@ -834,13 +1298,119 @@ static void on_raw_input(HRAWINPUT h)
         return;
     if (GetRawInputData(h, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) == size) {
         RAWINPUT *ri = (RAWINPUT *)buf;
-        if (ri->header.dwType == RIM_TYPEKEYBOARD)
-            on_raw_keyboard(&ri->data.keyboard);
-        else if (ri->header.dwType == RIM_TYPEMOUSE)
+        /* hDevice is NULL for input injected by software on this PC: never relayed */
+        if (ri->header.hDevice && ri->header.dwType == RIM_TYPEMOUSE)
             on_raw_mouse(&ri->data.mouse);
     }
     if (buf != stack)
         free(buf);
+}
+
+static LRESULT CALLBACK badge_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CAPTURE_KEY:
+        on_capture_key((UINT)wp, lp);
+        return 0;
+    case WM_INPUT:
+        on_raw_input((HRAWINPUT)lp);
+        return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE && g.armed && !g.preview)
+            focus_lost((HWND)lp);
+        break;
+    case WM_DISPLAYCHANGE:
+        if (g.armed && !g.preview) {
+            set_armed(0);
+            history_add('w', "Display changed - auto-disarmed");
+        }
+        badge_layout();
+        return 0;
+    case WM_SETCURSOR: /* armed: hidden while confined to the badge */
+        SetCursor(g.armed ? NULL : LoadCursor(NULL, g.badge_drag ? IDC_SIZEALL : IDC_HAND));
+        return TRUE;
+
+    /* Disarmed: a button that never takes the focus (so it can sit over a
+     * remote-desktop window). Click to arm, drag to move. */
+    case WM_MOUSEACTIVATE:
+        return g.armed ? MA_ACTIVATE : MA_NOACTIVATE;
+    case WM_LBUTTONDOWN:
+        if (!g.armed) {
+            SetCapture(hwnd);
+            g.badge_pressed = 1;
+            g.badge_drag = 0;
+            GetCursorPos(&g.drag_pt);
+            GetWindowRect(hwnd, &g.drag_rc);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (!g.armed) {
+            if (!g.badge_hover) {
+                TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&t);
+                g.badge_hover = 1;
+                badge_refresh();
+            }
+            if (g.badge_pressed) {
+                POINT p;
+                GetCursorPos(&p);
+                int dx = p.x - g.drag_pt.x, dy = p.y - g.drag_pt.y;
+                if (abs(dx) > GetSystemMetrics(SM_CXDRAG) || abs(dy) > GetSystemMetrics(SM_CYDRAG))
+                    g.badge_drag = 1;
+                if (g.badge_drag)
+                    SetWindowPos(hwnd, HWND_TOPMOST, g.drag_rc.left + dx, g.drag_rc.top + dy, 0, 0,
+                                 SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        g.badge_hover = 0;
+        badge_refresh();
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED: {
+        int pressed = g.badge_pressed, dragged = g.badge_drag;
+        g.badge_pressed = g.badge_drag = 0;
+        if (msg == WM_LBUTTONUP && pressed)
+            ReleaseCapture();
+        if (dragged)
+            badge_remember_position();
+        else if (msg == WM_LBUTTONUP && pressed && !g.armed)
+            set_armed(1);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        badge_paint(hwnd);
+        return 0;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        on_badge_keydown(wp);
+        return 0;
+    /* The badge itself never acts on input: no menus, no closing, no
+     * application commands from mouse side buttons. */
+    case WM_KEYUP: case WM_SYSKEYUP:
+    case WM_CHAR: case WM_SYSCHAR: case WM_SYSCOMMAND: case WM_CLOSE: case WM_DPICHANGED:
+        return 0;
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK: case WM_APPCOMMAND:
+        return TRUE;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void badge_create(void)
+{
+    g.badge = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, "HIDwayBadge", "HIDway",
+                              WS_POPUP, 0, 0, 10, 10, NULL, NULL, g.inst, NULL);
+    cap_badge = g.badge;
+    g.badge_dpi = 96;
+    g.badge_alpha = 0;
+    badge_set_alpha(150);
+    int corner = HW_DWMWCP_ROUND;
+    DwmSetWindowAttribute(g.badge, HW_DWMWA_CORNER, &corner, sizeof corner);
+    g.badge_border = C_CARD_BD;
+    DwmSetWindowAttribute(g.badge, HW_DWMWA_BORDER, &g.badge_border, sizeof g.badge_border);
+    badge_layout();
 }
 
 /* ======================================================================== */
@@ -1440,7 +2010,7 @@ static LRESULT CALLBACK list_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         GetClientRect(h, &r);
         fill_solid(dc, r, C_FIELD);
         text_in(dc, g.f_label, C_TEXT3, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                g.cfg.history_enabled ? "No input yet — arm to start relaying" : "History is turned off");
+                g.cfg.history_enabled ? "No input yet — arm to start relaying" : "Key history is turned off");
         EndPaint(h, &ps);
         return 0;
     }
@@ -1484,6 +2054,7 @@ static void apply_settings(void)
         hidway_config_save("hidway.ini", &g.cfg);
     if (!g.preview && (strcmp(old_target, g.cfg.target) != 0 || old_port != g.cfg.port)) {
         g.net_ok = (hidway_net_open(g.cfg.target, g.cfg.port) == 0);
+        hidway_net_notify(g.hwnd, WM_NET_READ);
         g.ever_status = 0;
         g.probes_unanswered = 0;
     }
@@ -1533,15 +2104,6 @@ static void create_controls(HWND h)
         subclass(btns[i], btn_proc);
 
     apply_layout();
-}
-
-static int register_raw_input(HWND hwnd)
-{
-    RAWINPUTDEVICE rid[2] = {
-        {0x01, 0x06, RIDEV_INPUTSINK, hwnd},
-        {0x01, 0x02, RIDEV_INPUTSINK, hwnd},
-    };
-    return RegisterRawInputDevices(rid, 2, sizeof rid[0]) ? 0 : -1;
 }
 
 static void apply_window_chrome(HWND hwnd)
@@ -1682,10 +2244,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         create_controls(hwnd);
         apply_window_chrome(hwnd);
         resize_to_layout(hwnd, NULL);
+        badge_create();
         if (!g.preview) {
-            if (register_raw_input(hwnd) != 0)
-                MessageBoxA(hwnd, "Failed to register raw input.", "HIDway", MB_ICONERROR);
+            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
             g.net_ok = (hidway_net_open(g.cfg.target, g.cfg.port) == 0);
+            hidway_net_notify(hwnd, WM_NET_READ);
             g.toggle_hk_ok = RegisterHotKey(hwnd, HK_TOGGLE, g.cfg.toggle.mods | MOD_NOREPEAT, g.cfg.toggle.vk) ? 1 : 0;
             if (g.cfg.panic.vk)
                 RegisterHotKey(hwnd, HK_PANIC, g.cfg.panic.mods | MOD_NOREPEAT, g.cfg.panic.vk);
@@ -1696,6 +2259,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g.shot_path[0])
                 SetTimer(hwnd, TIMER_SHOT, 900, NULL);
         }
+        badge_refresh(); /* preview: shown too, without taking anything over */
         SetTimer(hwnd, TIMER_UI, UI_REFRESH_MS, NULL);
         return 0;
 
@@ -1750,8 +2314,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_INPUT:
-        on_raw_input((HRAWINPUT)lp);
+    case WM_NET_READ:
+        net_drain_status();
         return 0;
 
     case WM_TRAYICON:
@@ -1763,6 +2327,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_STRING, IDM_PANIC, "Panic - release all");
             AppendMenuA(m, MF_SEPARATOR, 0, NULL);
             AppendMenuA(m, MF_STRING, IDM_SHOW, IsWindowVisible(hwnd) ? "Hide window" : "Show window");
+            AppendMenuA(m, MF_STRING | (g.cfg.badge ? MF_CHECKED : 0), IDM_BADGE, "Show badge (click to arm)");
             AppendMenuA(m, MF_SEPARATOR, 0, NULL);
             AppendMenuA(m, MF_STRING, IDM_QUIT, "Quit HIDway");
             POINT pt;
@@ -1778,6 +2343,31 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             show_main_window(0); /* minimize to tray */
         return 0;
 
+    /* Safety: anything that changes the screen or the session disarms. */
+    case WM_DISPLAYCHANGE:
+        if (g.armed && !g.preview) {
+            set_armed(0);
+            history_add('w', "Display changed - auto-disarmed");
+        }
+        badge_layout();
+        return 0;
+    case WM_WTSSESSION_CHANGE:
+        if (g.armed && (wp == WTS_SESSION_LOCK || wp == WTS_CONSOLE_DISCONNECT ||
+                        wp == WTS_REMOTE_DISCONNECT || wp == WTS_SESSION_LOGOFF)) {
+            set_armed(0);
+            history_add('w', "Session locked - auto-disarmed");
+        }
+        return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND && g.armed) {
+            set_armed(0);
+            history_add('w', "Sleep - auto-disarmed");
+        }
+        return TRUE;
+    case WM_QUERYENDSESSION:
+        set_armed(0);
+        return TRUE;
+
     case WM_HOTKEY:
         if (wp == HK_TOGGLE)
             set_armed(!g.armed);
@@ -1792,6 +2382,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_ARM: set_armed(!g.armed); return 0;
         case IDM_PANIC: set_armed(0); history_add('w', "PANIC - all released"); return 0;
         case IDM_SHOW: show_main_window(!IsWindowVisible(hwnd)); return 0;
+        case IDM_BADGE:
+            g.cfg.badge = !g.cfg.badge;
+            if (!g.preview)
+                hidway_config_save("hidway.ini", &g.cfg);
+            badge_refresh();
+            return 0;
         case IDM_QUIT: DestroyWindow(hwnd); return 0;
         }
         if (LOWORD(wp) >= ID_TARGET && LOWORD(wp) <= ID_AUTO) {
@@ -1840,9 +2436,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g.disp_y = g.cum_y;
                 g.disp_wheel = g.cum_wheel;
                 g.disp_pan = g.cum_pan;
+                if (g.armed)
+                    capture_tick();
             } else {
                 g.last_status_us = hidway_now_us(); /* preview: link always fresh */
             }
+            badge_refresh();
             invalidate_readouts();
         } else if (wp == TIMER_NET) {
             net_tick();
@@ -1875,6 +2474,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         tray_destroy();
+        if (!g.preview)
+            WTSUnRegisterSessionNotification(hwnd);
+        if (g.badge)
+            DestroyWindow(g.badge);
+        if (g.bf_main) DeleteObject(g.bf_main);
+        if (g.bf_hint) DeleteObject(g.bf_hint);
         KillTimer(hwnd, TIMER_UI);
         KillTimer(hwnd, TIMER_PROBE);
         UnregisterHotKey(hwnd, HK_TOGGLE);
@@ -1954,6 +2559,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.hIcon = appicon;
     wc.lpszClassName = "HIDwayClient";
     if (!RegisterClassA(&wc))
+        return 1;
+    WNDCLASSA bc = {0};
+    bc.lpfnWndProc = badge_proc;
+    bc.hInstance = inst;
+    bc.lpszClassName = "HIDwayBadge";
+    if (!RegisterClassA(&bc))
         return 1;
 
     g.dpi = GetDpiForSystem();

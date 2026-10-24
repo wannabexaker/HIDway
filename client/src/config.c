@@ -141,6 +141,8 @@ static void set_defaults(hidway_config_t *cfg)
     hidway_hotkey_parse("ctrl+shift+f12", &cfg->toggle);
     hidway_hotkey_parse("ctrl+alt+shift+end", &cfg->panic);
     cfg->window_x = cfg->window_y = INT_MIN;
+    cfg->badge = 1;
+    cfg->badge_x = cfg->badge_y = INT_MIN;
 }
 
 static int clampi(int v, int lo, int hi)
@@ -194,6 +196,12 @@ int hidway_config_load(const char *path, hidway_config_t *cfg)
             cfg->window_x = (int)strtol(val, NULL, 10);
         } else if (!strcmp(key, "window_y")) {
             cfg->window_y = (int)strtol(val, NULL, 10);
+        } else if (!strcmp(key, "badge")) {
+            cfg->badge = atoi(val) ? 1 : 0;
+        } else if (!strcmp(key, "badge_x")) {
+            cfg->badge_x = (int)strtol(val, NULL, 10);
+        } else if (!strcmp(key, "badge_y")) {
+            cfg->badge_y = (int)strtol(val, NULL, 10);
         } else if (!strcmp(key, "key")) {
             strncpy(cfg->key_hex, val, sizeof cfg->key_hex - 1);
             cfg->key_hex[sizeof cfg->key_hex - 1] = 0;
@@ -218,6 +226,11 @@ int hidway_config_save(const char *path, const hidway_config_t *cfg)
     fprintf(f, "history_enabled = %d\n\n", cfg->history_enabled);
     fprintf(f, "toggle_hotkey = %s\n", cfg->toggle.text);
     fprintf(f, "panic_hotkey = %s\n\n", cfg->panic.text);
+    fprintf(f, "badge = %d   # 1 = always on top (click to arm), 0 = only while armed\n", cfg->badge);
+    if (cfg->badge_x != INT_MIN && cfg->badge_y != INT_MIN) {
+        fprintf(f, "badge_x = %d\n", cfg->badge_x);
+        fprintf(f, "badge_y = %d\n", cfg->badge_y);
+    }
     if (cfg->window_x != INT_MIN && cfg->window_y != INT_MIN) {
         fprintf(f, "window_x = %d\n", cfg->window_x);
         fprintf(f, "window_y = %d\n", cfg->window_y);

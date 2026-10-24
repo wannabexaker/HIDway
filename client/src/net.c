@@ -1,6 +1,7 @@
 #include "net.h"
 
 #define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS /* WSAAsyncSelect: one GUI thread, no event loop */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <bcrypt.h>
@@ -66,6 +67,13 @@ void hidway_net_close(void)
         sock = INVALID_SOCKET;
     }
     /* WSACleanup is left to process exit so the socket can be reopened. */
+}
+
+int hidway_net_notify(void *hwnd, unsigned msg)
+{
+    if (sock == INVALID_SOCKET)
+        return -1;
+    return WSAAsyncSelect(sock, (HWND)hwnd, msg, FD_READ) == 0 ? 0 : -1;
 }
 
 int hidway_net_send(const uint8_t *buf, size_t len)

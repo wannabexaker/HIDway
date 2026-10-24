@@ -9,6 +9,11 @@
 int hidway_net_open(const char *host, int port);
 void hidway_net_close(void);
 
+/* Post `msg` to the window `hwnd` whenever a reply is waiting, so it is read
+ * (and its RTT measured) on arrival rather than at the next timer tick. Call
+ * again after every hidway_net_open. Returns 0 on success. */
+int hidway_net_notify(void *hwnd, unsigned msg);
+
 /* -1 on error, otherwise bytes sent. */
 int hidway_net_send(const uint8_t *buf, size_t len);
 

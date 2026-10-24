@@ -22,6 +22,10 @@ history_enabled = 1
 toggle_hotkey = ctrl+shift+f12
 panic_hotkey = ctrl+alt+shift+end
 
+# Always-on-top badge: click it to arm, drag it anywhere (it remembers where).
+# 1 = always shown, 0 = shown only while armed.
+badge = 1
+
 # End-to-end encryption (optional): the same 64 hex characters as the relay's
 # key file (created with `hidwayd --gen-key`, see docs/RELAY.md). Keep secret.
 # With a key every packet is sealed; a malformed key stops all sending.

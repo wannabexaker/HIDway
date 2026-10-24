@@ -21,6 +21,8 @@ typedef struct {
     hidway_hotkey_t toggle; /* arm/disarm hotkey */
     hidway_hotkey_t panic;  /* release everything + disarm */
     int window_x, window_y; /* last window position; INT_MIN = unset */
+    int badge;              /* show the badge while disarmed (click to arm) */
+    int badge_x, badge_y;   /* badge top centre on screen; INT_MIN = unset */
     char key_hex[80];       /* end-to-end key (64 hex chars); empty = encryption off */
 } hidway_config_t;
 
