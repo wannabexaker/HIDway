@@ -1,3 +1,9 @@
 # HIDway: stable name and group access for the Pi -> Pico serial link.
+# Use one link only; both rules create /dev/hidway-serial.
+
 # Raspberry Pi Debug Probe (VID 2e8a, PID 000c), CDC UART interface.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000c", GROUP="hidway", MODE="0660", SYMLINK+="hidway-serial"
+
+# Raspberry Pi 4 GPIO UART3 (TX GPIO4 / pin 7, RX GPIO5 / pin 29). Matches only
+# once dtoverlay=uart3 is enabled; see docs/RELAY.md.
+SUBSYSTEM=="tty", KERNEL=="ttyAMA3", KERNELS=="fe201600.serial", GROUP="hidway", MODE="0660", SYMLINK+="hidway-serial"
