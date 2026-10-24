@@ -187,9 +187,34 @@ client. To turn encryption off again, remove `--key-file` and the `key` line.
 Never commit or paste the key anywhere public; rotate it by generating a new
 one on both ends.
 
-The udev rule covers the Raspberry Pi Debug Probe. For another USB-serial
-adapter, point `HIDWAY_SERIAL` at its `/dev/serial/by-id/...` path and give the
-`hidway` group access to it with a similar rule.
+### Serial link to the Pico
+
+The Pico receives input on UART0: **GP1 (RX, pin 2)**, with **GP0 (TX,
+pin 1)** reserved for status, and **GND (pin 3)**. Connect it in one of two
+ways; both appear as `/dev/hidway-serial` through the udev rule.
+
+**Raspberry Pi Debug Probe** (or a Pico running the official `debugprobe`
+firmware) on a USB port of the Pi: no change to the Pi's configuration.
+
+**Directly to the Pi 4's GPIO header** using the spare UART3, which leaves the
+Pi's console UART and Bluetooth alone:
+
+| Pi 4 | Pico |
+|---|---|
+| pin 7 (GPIO4, TX) | pin 2 (GP1, RX) |
+| pin 29 (GPIO5, RX) | pin 1 (GP0, TX) |
+| pin 30 or 9 (GND) | pin 3 (GND) |
+
+```bash
+sudo dtoverlay uart3                      # enable now, no reboot (until the next boot)
+echo 'dtoverlay=uart3' | sudo tee -a /boot/firmware/config.txt   # keep it after reboots
+ls -l /dev/hidway-serial                  # -> ttyAMA3
+```
+
+A 1 kΩ resistor in series on each data line protects both boards while only
+one of them is powered. For another USB-serial adapter, point `HIDWAY_SERIAL`
+at its `/dev/serial/by-id/...` path and give the `hidway` group access to it
+with a similar rule.
 
 ## Layout
 
@@ -204,7 +229,7 @@ adapter, point `HIDWAY_SERIAL` at its `/dev/serial/by-id/...` path and give the
 | `/etc/hidway/update.conf` | Updater settings (repository, tags or branch, releases kept) |
 | `/etc/systemd/system/hidwayd.service` | The relay service |
 | `/etc/systemd/system/hidway-update.{service,timer}` | Daily release check |
-| `/etc/udev/rules.d/99-hidway.rules` | `/dev/hidway-serial` for the Raspberry Pi Debug Probe |
+| `/etc/udev/rules.d/99-hidway.rules` | `/dev/hidway-serial` for the Debug Probe or the Pi 4 GPIO UART3 |
 | `/etc/update-motd.d/60-hidway` | Status line at login |
 | `/usr/local/sbin/hidway-update` | Update / rollback command |
 | `/usr/local/bin/hidway-status` | Status command (no root needed) |

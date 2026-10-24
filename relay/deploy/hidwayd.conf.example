@@ -11,8 +11,9 @@ HIDWAY_ALLOW=<client-tailscale-ip>
 HIDWAY_PORT=47800
 
 # Serial device of the Pi -> Pico link. /dev/hidway-serial is created by the
-# udev rule for the Raspberry Pi Debug Probe; for another adapter use its
-# /dev/serial/by-id/... path (and give the hidway group access to it).
+# udev rule for the Raspberry Pi Debug Probe or the Pi 4 GPIO UART3; for
+# another adapter use its /dev/serial/by-id/... path (and give the hidway
+# group access to it).
 HIDWAY_SERIAL=/dev/hidway-serial
 HIDWAY_BAUD=921600
 

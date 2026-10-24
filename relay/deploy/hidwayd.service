@@ -38,6 +38,7 @@ PrivateTmp=yes
 DevicePolicy=closed
 DeviceAllow=char-ttyACM rw
 DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyAMA rw
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
