@@ -76,6 +76,18 @@ HIDway can additionally seal every packet itself (XChaCha20‑Poly1305 with a
 pre‑shared key, replay‑protected); see
 [docs/RELAY.md](docs/RELAY.md#end-to-end-encryption-optional).
 
+## Hardware
+
+<p align="center">
+  <img src="docs/images/hardware.jpg" alt="Raspberry Pi Pico 2 on a breadboard with four status LEDs" width="56%">
+  <img src="docs/images/hardware-leds.jpg" alt="The prototype connected to the target, red status LED on" width="40%">
+</p>
+
+The prototype: a Raspberry Pi Pico 2 on a breadboard, plugged into the target
+over USB and wired to the Raspberry Pi's GPIO UART (two data lines through
+series resistors, plus ground), with the four status LEDs described under
+[Pico firmware](#pico-firmware). Wiring: [docs/RELAY.md](docs/RELAY.md#serial-link-to-the-pico).
+
 ## Build
 
 ### Host unit tests (any platform with a C compiler + CMake)
