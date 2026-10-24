@@ -13,4 +13,8 @@ void link_task(void);
 /* True if a valid frame arrived recently (for the status LED). */
 bool link_active(void);
 
+/* True for a few seconds after a link problem: the input stopped without a
+ * RELEASE (relay, Pi or wiring trouble), or corrupt frames keep arriving. */
+bool link_error(void);
+
 #endif /* HIDWAY_LINK_H */

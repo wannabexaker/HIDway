@@ -383,7 +383,11 @@ static void test_serial(void)
     for (size_t i = 0; i < n; i++)
         done = hidway_deframer_push(&d, frame[i], &got);
     CHECK(!done);
+    CHECK(d.bad >= 1); /* counted, for the error LED */
     frame[3] ^= 0xFF;
+    uint32_t bad = d.bad;
+    hidway_deframer_push(&d, 0x00, &got); /* an empty frame is not an error */
+    CHECK(d.bad == bad);
 
     /* Leading noise before the first delimiter is skipped cleanly. */
     hidway_deframer_reset(&d);

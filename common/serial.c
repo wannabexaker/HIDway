@@ -65,6 +65,7 @@ void hidway_deframer_reset(hidway_deframer_t *d)
 {
     d->len = 0;
     d->overflow = false;
+    d->bad = 0;
 }
 
 bool hidway_deframer_push(hidway_deframer_t *d, uint8_t byte, hidway_serial_state_t *out)
@@ -85,6 +86,8 @@ bool hidway_deframer_push(hidway_deframer_t *d, uint8_t byte, hidway_serial_stat
         if (plen > 0)
             ok = decode_payload(payload, plen, out);
     }
+    if (!ok && (d->overflow || d->len > 0))
+        d->bad++;
     d->len = 0;
     d->overflow = false;
     return ok;

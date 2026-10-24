@@ -39,11 +39,13 @@ typedef struct {
 size_t hidway_serial_build(const hidway_serial_state_t *s, uint8_t *out, size_t cap);
 
 /* Incremental receiver: feed bytes as they arrive. Returns true and fills
- * *out when a complete, CRC-valid frame ends at this byte (a 0x00). */
+ * *out when a complete, CRC-valid frame ends at this byte (a 0x00). `bad`
+ * counts non-empty frames that were dropped (corrupt, cut short, too long). */
 typedef struct {
     uint8_t buf[HIDWAY_SER_FRAME_MAX];
     size_t len;
     bool overflow;
+    uint32_t bad;
 } hidway_deframer_t;
 
 void hidway_deframer_reset(hidway_deframer_t *d);

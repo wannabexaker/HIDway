@@ -4,8 +4,11 @@
 #include "hardware/irq.h"
 #include "hardware/uart.h"
 #include "hid_out.h"
+#include "led.h"
 #include "pico/time.h"
 #include "serial.h"
+
+#include <string.h>
 
 /* UART0 on GP0 (TX) / GP1 (RX). TX is unused for now (Pi -> Pico only). */
 #define LINK_UART      uart0
@@ -16,6 +19,8 @@
 #define LINK_TIMEOUT_MS 250 /* no valid frame -> release everything */
 #define LINK_CATCHUP_MS 100 /* larger gap -> resync instead of replaying motion */
 #define LINK_LED_MS     200
+#define LINK_ERROR_MS   3000 /* how long a link problem is shown */
+#define LINK_BAD_GAP_MS 1000 /* two dropped frames this close = a wiring problem */
 
 /* Single-producer (IRQ) / single-consumer (main) byte ring. */
 #define RING_SIZE 2048
@@ -28,7 +33,37 @@ static bool have_base;
 static int32_t base_x, base_y;
 static int16_t base_wheel, base_pan;
 static absolute_time_t last_frame_time;
-static bool linked;
+static bool linked; /* a session is running: STATE frames since the last RELEASE */
+
+/* Status LEDs: press edges, and recent link problems. */
+static uint8_t prev_mods, prev_buttons, prev_keys[HIDWAY_KEY_BITMAP_BYTES];
+static uint32_t seen_bad;
+static absolute_time_t last_bad, error_until;
+
+static void flag_error(absolute_time_t now)
+{
+    error_until = delayed_by_ms(now, LINK_ERROR_MS);
+}
+
+static void forget_presses(void)
+{
+    prev_mods = prev_buttons = 0;
+    memset(prev_keys, 0, sizeof prev_keys);
+}
+
+static void note_presses(const hidway_serial_state_t *s)
+{
+    bool key = (s->mods & (uint8_t)~prev_mods) != 0;
+    for (int i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
+        key |= (s->keys[i] & (uint8_t)~prev_keys[i]) != 0;
+    if (key)
+        led_pulse_key();
+    if (s->buttons & (uint8_t)~prev_buttons)
+        led_pulse_click();
+    prev_mods = s->mods;
+    prev_buttons = s->buttons;
+    memcpy(prev_keys, s->keys, sizeof prev_keys);
+}
 
 static void __isr link_uart_isr(void)
 {
@@ -60,6 +95,9 @@ void link_init(void)
     have_base = false;
     linked = false;
     last_frame_time = get_absolute_time();
+    seen_bad = 0;
+    last_bad = error_until = nil_time;
+    forget_presses();
 }
 
 static void apply_frame(const hidway_serial_state_t *s)
@@ -69,9 +107,14 @@ static void apply_frame(const hidway_serial_state_t *s)
     if (s->type == HIDWAY_SER_RELEASE) {
         hid_out_release_all();
         have_base = false; /* next STATE re-baselines, no motion jump */
+        forget_presses();
+        last_frame_time = now;
+        linked = false; /* a clean end: the timeout below is not a problem */
+        return;
     } else {
         hid_out_set_keyboard(s->mods, s->keys);
         hid_out_set_buttons(s->buttons);
+        note_presses(s);
 
         int64_t gap_us = absolute_time_diff_us(last_frame_time, now);
         if (have_base && gap_us <= (int64_t)LINK_CATCHUP_MS * 1000) {
@@ -103,12 +146,27 @@ void link_task(void)
             apply_frame(&s);
     }
 
-    if (linked && absolute_time_diff_us(last_frame_time, get_absolute_time()) >
-                      (int64_t)LINK_TIMEOUT_MS * 1000) {
+    absolute_time_t now = get_absolute_time();
+    if (deframer.bad != seen_bad) { /* corrupt frames: one is noise, two close together a problem */
+        seen_bad = deframer.bad;
+        if (!is_nil_time(last_bad) && absolute_time_diff_us(last_bad, now) < (int64_t)LINK_BAD_GAP_MS * 1000)
+            flag_error(now);
+        last_bad = now;
+    }
+
+    if (linked && absolute_time_diff_us(last_frame_time, now) > (int64_t)LINK_TIMEOUT_MS * 1000) {
+        /* The input stopped without a RELEASE: relay, Pi or wiring trouble. */
         hid_out_release_all();
         have_base = false;
         linked = false;
+        forget_presses();
+        flag_error(now);
     }
+}
+
+bool link_error(void)
+{
+    return !is_nil_time(error_until) && absolute_time_diff_us(get_absolute_time(), error_until) > 0;
 }
 
 bool link_active(void)

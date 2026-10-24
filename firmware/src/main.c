@@ -14,25 +14,31 @@
 #endif
 
 #define HIDWAY_WATCHDOG_MS 100
+#define HIDWAY_CRASH_SHOW_MS 3000
+
+static bool hang_reboot; /* this boot follows a hang */
 
 static led_mode_t led_mode(void)
 {
-    if (!tud_mounted())
-        return LED_BLINK_SLOW;
-    if (tud_suspended())
-        return LED_OFF;
+    if (!tud_mounted() || tud_suspended())
+        return LED_OFF; /* host off, starting up or asleep: stay dark */
+    if (hang_reboot && to_ms_since_boot(get_absolute_time()) < HIDWAY_CRASH_SHOW_MS)
+        return LED_ERROR;
 #if HIDWAY_T0
     if (t0_active())
-        return LED_BLINK_FAST;
+        return LED_ACTIVE;
 #else
+    if (link_error())
+        return LED_ERROR;
     if (link_active())
-        return LED_BLINK_FAST;
+        return LED_ACTIVE;
 #endif
-    return LED_ON;
+    return LED_IDLE;
 }
 
 int main(void)
 {
+    hang_reboot = watchdog_enable_caused_reboot();
     led_init();
     hid_out_init();
     tud_init(BOARD_TUD_RHPORT);
