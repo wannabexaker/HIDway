@@ -181,6 +181,8 @@ static struct {
     uint8_t keys[HIDWAY_KEY_BITMAP_BYTES];
     uint8_t buttons;
 
+    uint8_t key_buttons; /* mouse buttons held through mouse4_key / mouse5_key */
+
     int32_t cum_x, cum_y;
     int16_t cum_wheel, cum_pan;
     int wheel_rem_v, wheel_rem_h;
@@ -517,7 +519,7 @@ static void net_send_state(uint8_t type)
             memcpy(p.keys, g.keys, sizeof p.keys);
         }
         if (g.cfg.relay_mouse) {
-            p.buttons = g.buttons;
+            p.buttons = g.buttons | g.key_buttons;
             p.x = g.cum_x;
             p.y = g.cum_y;
             p.wheel = g.cum_wheel;
@@ -755,6 +757,7 @@ static void clear_relay_state(void)
     g.modifiers = 0;
     memset(g.keys, 0, sizeof g.keys);
     g.buttons = 0;
+    g.key_buttons = 0;
 }
 
 static int net_interval_ms(void)
@@ -879,16 +882,16 @@ static COLORREF badge_texts(char *st, size_t st_cap, char *hint, size_t hint_cap
 {
     char hk[48];
     hotkey_pretty(g.cfg.toggle.text, hk, sizeof hk);
-    if (!g.armed) { /* a small "Arm" pill; no hint, to keep it out of the way */
+    if (!g.armed) { /* a small "Arm" pill with a red dot; no hint, to keep it out of the way */
         hint[0] = 0;
         (void)hint_cap;
         snprintf(st, st_cap, link_recent() ? "Arm" : "Offline");
-        return link_recent() ? C_TEXT3 : C_WARN;
+        return C_WARN;
     }
     snprintf(hint, hint_cap, "%s to release", hk);
     if (!link_recent()) {
         snprintf(st, st_cap, "ARMED  ·  no link");
-        return C_WARN;
+        return C_AMBER;
     }
     snprintf(st, st_cap, "ARMED  ·  %d ms", g.rtt_ms);
     return C_LIVE;
@@ -913,8 +916,8 @@ static void badge_layout(void)
 
     if (g.bf_main) DeleteObject(g.bf_main);
     if (g.bf_hint) DeleteObject(g.bf_hint);
-    g.bf_main = badge_font(110, FW_SEMIBOLD);
-    g.bf_hint = badge_font(100, FW_NORMAL);
+    g.bf_main = badge_font(120, FW_SEMIBOLD);
+    g.bf_hint = badge_font(105, FW_NORMAL);
 
     /* Disarmed: a small pill wide enough for "Offline". Armed: room for the
      * widest status and the release hint. */
@@ -925,11 +928,11 @@ static void badge_layout(void)
         char hk[48], hint[64];
         hotkey_pretty(g.cfg.toggle.text, hk, sizeof hk);
         snprintf(hint, sizeof hint, "%s to release", hk);
-        w = BS(25) + text_w(dc, g.bf_main, "ARMED  ·  9999 ms") + BS(18) + text_w(dc, g.bf_hint, hint) + BS(12);
-        h = BS(28);
+        w = BS(30) + text_w(dc, g.bf_main, "ARMED  ·  9999 ms") + BS(18) + text_w(dc, g.bf_hint, hint) + BS(16);
+        h = BS(32);
     } else {
-        w = BS(21) + text_w(dc, g.bf_main, "Offline") + BS(10);
-        h = BS(22);
+        w = BS(30) + text_w(dc, g.bf_main, "Offline") + BS(16);
+        h = BS(32);
     }
     ReleaseDC(g.badge, dc);
 
@@ -971,14 +974,13 @@ static void badge_paint(HWND hwnd)
     char st[48], hint[64];
     COLORREF c = badge_texts(st, sizeof st, hint, sizeof hint);
     int cy = rc.bottom / 2;
+    dot(mem, BS(16), cy, BS(5), c);
     if (g.armed) {
-        dot(mem, BS(14), cy, BS(4), c);
-        text_vc(mem, g.bf_main, C_TEXT, BS(25), cy, st);
-        RECT hr = {0, 0, rc.right - BS(12), rc.bottom};
+        text_vc(mem, g.bf_main, C_TEXT, BS(30), cy, st);
+        RECT hr = {0, 0, rc.right - BS(16), rc.bottom};
         text_in(mem, g.bf_hint, C_TEXT3, hr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, hint);
     } else {
-        dot(mem, BS(11), cy, BS(3), c);
-        text_vc(mem, g.bf_main, g.badge_hover ? C_TEXT : C_TEXT2, BS(20), cy, st);
+        text_vc(mem, g.bf_main, g.badge_hover ? C_TEXT : C_TEXT2, BS(30), cy, st);
     }
 
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -1022,7 +1024,7 @@ static void badge_refresh(void)
     if (g.armed)
         a = timeGetTime() - g.armed_at_ms > BADGE_FADE_MS && link_recent() ? 120 : 240;
     else
-        a = g.badge_hover || g.badge_drag ? 240 : 150;
+        a = g.badge_hover || g.badge_drag ? 250 : 200;
     badge_set_alpha(a);
 
     COLORREF bd = g.armed ? C_LIVE_BD : C_CARD_BD;
@@ -1221,6 +1223,16 @@ static void on_capture_key(UINT vk, LPARAM info)
             history_add('w', "Reserved shortcut - disarmed");
             return;
         }
+    }
+    /* A key standing in for a mouse side button (mouse4_key / mouse5_key):
+     * held while the key is held, one press for one press. */
+    if ((g.cfg.mouse4.vk && vk == g.cfg.mouse4.vk) || (g.cfg.mouse5.vk && vk == g.cfg.mouse5.vk)) {
+        uint8_t bit = vk == g.cfg.mouse4.vk ? BTN_X1 : BTN_X2;
+        bool was = (g.key_buttons & bit) != 0;
+        if (up) g.key_buttons &= (uint8_t)~bit; else g.key_buttons |= bit;
+        if (was != !up)
+            history_add(up ? 'u' : 'd', bit == BTN_X1 ? "Mouse back (key)" : "Mouse forward (key)");
+        return;
     }
     /* Ctrl+Alt+End is Ctrl+Alt+Del on the target, as in Remote Desktop. */
     if (vk == VK_END && (g.end_as_del || (!up && (mods & MOD_CONTROL) && (mods & MOD_ALT)))) {

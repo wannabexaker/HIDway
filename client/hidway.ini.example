@@ -22,6 +22,13 @@ history_enabled = 1
 toggle_hotkey = ctrl+shift+f12
 panic_hotkey = ctrl+alt+shift+end
 
+# Optional: while armed, a key of this PC acts as a mouse side button on the
+# target (held while the key is held), e.g. for a mouse without side buttons.
+# The key itself is not sent. Names as for hotkeys, plus grave (the key left of
+# 1), capslock, rctrl, ralt, apps, scrolllock, pause.
+# mouse4_key = grave
+# mouse5_key =
+
 # Always-on-top badge: click it to arm, drag it anywhere (it remembers where).
 # 1 = always shown, 0 = shown only while armed.
 badge = 1

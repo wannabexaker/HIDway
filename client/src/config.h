@@ -20,6 +20,8 @@ typedef struct {
     int history_enabled;    /* record recent-input history in the UI */
     hidway_hotkey_t toggle; /* arm/disarm hotkey */
     hidway_hotkey_t panic;  /* release everything + disarm */
+    hidway_hotkey_t mouse4; /* key that acts as mouse button 4 while armed (vk 0 = none) */
+    hidway_hotkey_t mouse5; /* key that acts as mouse button 5 while armed (vk 0 = none) */
     int window_x, window_y; /* last window position; INT_MIN = unset */
     int badge;              /* show the badge while disarmed (click to arm) */
     int badge_x, badge_y;   /* badge top centre on screen; INT_MIN = unset */

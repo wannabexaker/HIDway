@@ -121,9 +121,18 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   green armed, yellow flash per mouse click, blue flash per key press; dark
   when the target is off or asleep. Pins 21–25 (blue, yellow, GND, green, red).
   Deframer counts dropped frames (unit-tested). Verified on the breadboard.
-- [ ] **20. Video with Sunshine + Moonlight** — lower-latency picture than
-  AnyDesk, with Sunshine's own keyboard/mouse input disabled so the target is
-  controlled by HIDway only.
+- [x] **20. Video with Sunshine + Moonlight** (2026-10-25) — Sunshine on the
+  target with keyboard/mouse/gamepad input disabled; Moonlight here in
+  borderless-windowed mode with "optimize mouse for remote desktop", so the
+  badge can be clicked over it and the stream keeps running while HIDway holds
+  the focus. User: "much faster than AnyDesk". Lesson: a stream session
+  started before Sunshine's input was disabled keeps the old setting (stop it
+  and start again); two Moonlight instances overwrite each other's settings.
+- [x] **21. Key as a mouse side button** (2026-10-25) — `mouse4_key` /
+  `mouse5_key` in `hidway.ini`: while armed the key is not sent and the target
+  sees mouse button 4/5 held for as long as the key is held (1:1). New key
+  names: grave, capslock, rctrl, ralt, apps, scrolllock, pause. Badge: larger,
+  red dot when disarmed, green when armed. Verified by the user (Mouse 4).
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,

@@ -49,6 +49,13 @@ static unsigned key_name_to_vk(const char *k)
     if (!strcmp(k, "down")) return VK_DOWN;
     if (!strcmp(k, "left")) return VK_LEFT;
     if (!strcmp(k, "right")) return VK_RIGHT;
+    if (!strcmp(k, "capslock") || !strcmp(k, "caps")) return VK_CAPITAL;
+    if (!strcmp(k, "grave") || !strcmp(k, "backtick")) return VK_OEM_3;
+    if (!strcmp(k, "rctrl")) return VK_RCONTROL;
+    if (!strcmp(k, "ralt")) return VK_RMENU;
+    if (!strcmp(k, "apps") || !strcmp(k, "menu")) return VK_APPS;
+    if (!strcmp(k, "scrolllock")) return VK_SCROLL;
+    if (!strcmp(k, "pause")) return VK_PAUSE;
     return 0;
 }
 
@@ -77,6 +84,13 @@ static void vk_to_name(unsigned vk, char *out, size_t cap)
     case VK_DOWN: strncpy(out, "down", cap); break;
     case VK_LEFT: strncpy(out, "left", cap); break;
     case VK_RIGHT: strncpy(out, "right", cap); break;
+    case VK_CAPITAL: strncpy(out, "capslock", cap); break;
+    case VK_OEM_3: strncpy(out, "grave", cap); break;
+    case VK_RCONTROL: strncpy(out, "rctrl", cap); break;
+    case VK_RMENU: strncpy(out, "ralt", cap); break;
+    case VK_APPS: strncpy(out, "apps", cap); break;
+    case VK_SCROLL: strncpy(out, "scrolllock", cap); break;
+    case VK_PAUSE: strncpy(out, "pause", cap); break;
     default: snprintf(out, cap, "vk0x%02X", vk); break;
     }
     out[cap - 1] = 0;
@@ -192,6 +206,10 @@ int hidway_config_load(const char *path, hidway_config_t *cfg)
             hidway_hotkey_parse(val, &cfg->toggle);
         } else if (!strcmp(key, "panic_hotkey")) {
             hidway_hotkey_parse(val, &cfg->panic);
+        } else if (!strcmp(key, "mouse4_key")) {
+            hidway_hotkey_parse(val, &cfg->mouse4);
+        } else if (!strcmp(key, "mouse5_key")) {
+            hidway_hotkey_parse(val, &cfg->mouse5);
         } else if (!strcmp(key, "window_x")) {
             cfg->window_x = (int)strtol(val, NULL, 10);
         } else if (!strcmp(key, "window_y")) {
@@ -226,6 +244,14 @@ int hidway_config_save(const char *path, const hidway_config_t *cfg)
     fprintf(f, "history_enabled = %d\n\n", cfg->history_enabled);
     fprintf(f, "toggle_hotkey = %s\n", cfg->toggle.text);
     fprintf(f, "panic_hotkey = %s\n\n", cfg->panic.text);
+    if (cfg->mouse4.vk || cfg->mouse5.vk) {
+        fprintf(f, "# While armed, these keys act as mouse side buttons on the target.\n");
+        if (cfg->mouse4.vk)
+            fprintf(f, "mouse4_key = %s\n", cfg->mouse4.text);
+        if (cfg->mouse5.vk)
+            fprintf(f, "mouse5_key = %s\n", cfg->mouse5.text);
+        fprintf(f, "\n");
+    }
     fprintf(f, "badge = %d   # 1 = always on top (click to arm), 0 = only while armed\n", cfg->badge);
     if (cfg->badge_x != INT_MIN && cfg->badge_y != INT_MIN) {
         fprintf(f, "badge_x = %d\n", cfg->badge_x);

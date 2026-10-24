@@ -114,7 +114,15 @@ focus, and can be dragged anywhere) or with Ctrl+Shift+F12; the same hotkey
 disarms. Anything that takes the focus away, locks the PC, changes the display
 or drops the link disarms automatically and releases everything on the
 target. Nothing is read while disarmed, and input injected by software on this
-PC is never relayed.
+PC is never relayed. For a mouse without side buttons, `mouse4_key` /
+`mouse5_key` in `hidway.ini` let a key act as that button (held while held).
+
+For the picture, any remote-desktop or game-streaming client works with its
+own input turned off on the target; [Sunshine](https://github.com/LizardByte/Sunshine)
+on the target with keyboard/mouse/gamepad input disabled and
+[Moonlight](https://moonlight-stream.org/) here (display mode *Borderless
+windowed*, *Optimize mouse for remote desktop* on) give a low-latency picture
+while HIDway carries the input.
 
 The client also lives in the system tray: grey = disarmed, green = armed and
 linked, red = link lost. Minimising sends it to the tray.
