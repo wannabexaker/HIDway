@@ -203,7 +203,9 @@ Last updated 2026-10-25.
   config parsing, bad input, fake-root install, shellcheck clean.
   Next: target power state (on/asleep/off) from the Pico over its TX line and
   a "Wake" button in the client.
-- [~] **28. Target state and Wake in the client** (2026-10-25) — the Pico
+- [x] **28. Target state and Wake in the client** (2026-10-25) — DONE: the
+  user pressed WAKE in the client with the target shut down and it switched
+  on (2026-10-25). The Pico
   reports the target over its TX line (new serial frame `HIDWAY_SER_TARGET`:
   on / asleep / off from USB mount/suspend; on change and every 3 s); the
   relay reads it (serial now read-write), expires it after 10 s silence
@@ -223,6 +225,20 @@ Last updated 2026-10-25.
 - [x] **27. Updater: no false "service files changed"** (2026-10-25) — only
   the files `--apply-system` installs count, not examples or docs;
   `.gitattributes` keeps the Linux scripts LF in Windows checkouts.
+- [x] **29. Relay: no replay across a restart** — DONE 2026-10-25 · `639d652`.
+  With encryption on, nothing sealed before the relay's start is accepted
+  (closes the item-26 idea). Unit test; in Linux the previous relay answered
+  a packet sealed 3 s before its start, the new one rejects it and logs why,
+  normal traffic unaffected.
+- [x] **30. Firmware defaults to the relay link** — DONE 2026-10-25 ·
+  `639d652`. `HIDWAY_T0` default OFF (a plain build was the test mode);
+  `tools/build.ps1` passes it on every run (`-T0` for the test mode).
+  Verified: default build has `HIDWAY_T0=0`; local cache switched to OFF.
+- [x] **31. One version everywhere** — DONE 2026-10-25 · `639d652`. From the
+  release tag (`git describe`), regenerated on every build: exe properties of
+  client and probe (were fixed at 0.1.0), next to the title in the client,
+  `hidway-probe --version`, firmware binary info (`picotool info`). Verified
+  with MSVC (warnings as errors), a client screenshot and `picotool info`.
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,
@@ -239,12 +255,8 @@ nothing ships as an installer before hardening and serious testing.
      1 update pending) — checked 2026-10-25.
    - Tailscale ACL: only the player PC may reach the Pi's UDP 47800 (and SSH),
      and the target PC's Sunshine ports.
-   - Relay: reject packets older than the relay's start, so a restart cannot
-     reopen the 2-minute replay window (from item 26).
    - Decide: end-to-end encryption on by default?
 2. **Device correctness**
-   - Firmware: `HIDWAY_T0` defaults to ON in `firmware/CMakeLists.txt`, so a
-     plain build is the test mode; default to OFF.
    - Honest USB identity: VID 0xCAFE is a development placeholder; request a
      PID under the Raspberry Pi VID 0x2E8A (raspberrypi/usb-pid).
    - Completeness (item 14), at least NKRO and host Caps/Num Lock feedback.
@@ -255,11 +267,10 @@ nothing ships as an installer before hardening and serious testing.
    written yet) and a latency report; 8-hour soak; clear errors for a bad
    `hidway.ini` / `hidwayd.conf`.
 4. **Professional image**
-   - Versions: the exe says 0.1.0.0 (`client/app.rc`) and the client shows
-     no version; take it from the release tag everywhere.
    - README screenshot is from 2026-10-06 (before the badge and the PC tile).
-   - Docs: ARCHITECTURE still describes the Debug Probe link, ROADMAP is
-     stale, no CHANGELOG.
+   - Docs: ARCHITECTURE is the original plan in Greek, names a specific game
+     and its anti-cheat, and still describes the Debug Probe link; rewrite in
+     English, game-neutral, as built. ROADMAP is stale, no CHANGELOG.
    - Code: `client/src/main.c` is 2,700 lines; split into modules (also the
      base for Linux/macOS clients).
    - Hardware: soldered board in an enclosure with the 1 kΩ resistors, photos.
@@ -270,7 +281,6 @@ nothing ships as an installer before hardening and serious testing.
 
 ## Waiting on the user
 
-- Press WAKE in the client with the target PC shut down (item 28).
 - Pi SSH / updates and the Tailscale ACL are system settings: the user
   applies them (commands provided).
 - USB PID request is filed from the owner's GitHub account (text prepared).
@@ -282,6 +292,9 @@ nothing ships as an installer before hardening and serious testing.
   no longer "not on hardware / not on the Pi"; 9 and 18 SKIPPED (resolved by
   22); 22 notes "run unattended". Added Next (hardening and testing before
   installers) and Waiting.
+- 2026-10-25 — 28 DONE (user: WAKE switched the shut-down PC on). 29, 30, 31
+  DONE (`639d652`). Pi SSH key-only and automatic updates: commands given to
+  the user.
 
 ## Hardware
 
