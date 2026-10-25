@@ -359,8 +359,12 @@ cmd_apply_system() {
     (
         tmp=$(mktemp -d)
         trap 'rm -rf "$tmp"' EXIT
-        for f in "${DEPLOY_FILES[@]}"; do
-            as_build cat "$SRC/relay/deploy/$f" >"$tmp/$f"
+        # Every file of that release's deploy directory, not this script's
+        # list: a release may add service files this (older) copy does not know.
+        for p in "$SRC"/relay/deploy/*; do
+            if [[ -f $p ]]; then
+                as_build cat "$p" >"$tmp/${p##*/}"
+            fi
         done
         HIDWAY_ROOT=$ROOT bash "$tmp/install.sh" --refresh "$tmp"
     )
