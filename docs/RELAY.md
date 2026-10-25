@@ -48,6 +48,7 @@ HIDway relay: OK
   relay     running v0.1.5, up 3h 12m
   session   idle (last input: 2026-10-06 22:41)
   serial    /dev/hidway-serial connected
+  target    PC on (reported by the Pico); wake-on-LAN ready
   updates   following release tags; last check 2026-10-07 04:43: up-to-date - running v0.1.5
             next check: 2026-10-08 04:51 (now: sudo hidway-update)
   system    service files up to date
@@ -106,8 +107,9 @@ works on demand.
 back from, is held: it is not deployed again automatically. The next newer
 release replaces it; `sudo hidway-update --now` retries it on purpose.
 
-**Resource use.** Idle, `hidwayd` sleeps until there is work: no periodic
-wakeups at all. The updater runs with idle CPU and I/O priority, at most
+**Resource use.** Idle, `hidwayd` sleeps until there is work: the only
+regular wakeup is the Pico's short status report every three seconds while
+it has power. The updater runs with idle CPU and I/O priority, at most
 256 MB of memory and 15 minutes; the relay is limited to 32 MB and 4 tasks.
 
 What the Pi follows is set in `/etc/hidway/update.conf`:
@@ -190,9 +192,11 @@ one on both ends.
 
 ### Serial link to the Pico
 
-The Pico receives input on UART0: **GP1 (RX, pin 2)**, with **GP0 (TX,
-pin 1)** reserved for status, and **GND (pin 3)**. Connect it in one of two
-ways; both appear as `/dev/hidway-serial` through the udev rule.
+The Pico receives input on UART0: **GP1 (RX, pin 2)**, reports the target
+PC's state (on / asleep / off, from its USB connection) on **GP0 (TX, pin 1)**,
+and shares **GND (pin 3)**. Connect it in one of two ways; both appear as
+`/dev/hidway-serial` through the udev rule. Without the TX line everything
+works except the target's state, which then shows as unknown.
 
 **Raspberry Pi Debug Probe** (or a Pico running the official `debugprobe`
 firmware) on a USB port of the Pi: no change to the Pi's configuration.
@@ -245,6 +249,13 @@ HIDWAY_WAKE_TO=<router-ip>:9        # only when the target is behind another rou
 Then run `hidway-wake` (or `hidway-wake <mac> [<ipv4>[:<port>]]`). When the
 target is on the Pi's own network, leave `HIDWAY_WAKE_TO` unset and the packet
 goes to the local broadcast address.
+
+The relay reads the same two settings (restart it after setting them:
+`sudo systemctl restart hidwayd`), so the client can wake the target too: its
+**PC** tile shows the target's state as the Pico reports it (on, asleep, off)
+and offers **WAKE** while it is not on (also in the tray menu). A wake request
+is accepted only from the allowed client (and sealed, with encryption on), can
+only send this configured packet, and at most once every three seconds.
 
 Magic packets do not cross routers. If the target sits behind a second router
 (double NAT), forward UDP port 9 **from the Pi only** to the target there, and

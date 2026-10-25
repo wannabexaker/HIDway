@@ -6,11 +6,14 @@
 #include "hid_out.h"
 #include "led.h"
 #include "pico/time.h"
+#include "protocol.h" /* HIDWAY_TARGET_* */
 #include "serial.h"
+#include "tusb.h"
 
 #include <string.h>
 
-/* UART0 on GP0 (TX) / GP1 (RX). TX is unused for now (Pi -> Pico only). */
+/* UART0 on GP0 (TX) / GP1 (RX). RX carries the input state from the Pi; TX
+ * reports the target PC's state (on / asleep / off) back to it. */
 #define LINK_UART      uart0
 #define LINK_TX_PIN    0
 #define LINK_RX_PIN    1
@@ -21,6 +24,7 @@
 #define LINK_LED_MS     200
 #define LINK_ERROR_MS   3000 /* how long a link problem is shown */
 #define LINK_BAD_GAP_MS 1000 /* two dropped frames this close = a wiring problem */
+#define LINK_TARGET_MS  3000 /* repeat the target report at least this often */
 
 /* Single-producer (IRQ) / single-consumer (main) byte ring. */
 #define RING_SIZE 2048
@@ -39,6 +43,23 @@ static bool linked; /* a session is running: STATE frames since the last RELEASE
 static uint8_t prev_mods, prev_buttons, prev_keys[HIDWAY_KEY_BITMAP_BYTES];
 static uint32_t seen_bad;
 static absolute_time_t last_bad, error_until;
+
+/* Target report to the Pi. */
+static uint8_t sent_target = 0xFF;
+static absolute_time_t next_target;
+
+static void report_target(absolute_time_t now)
+{
+    uint8_t t = !tud_mounted() ? HIDWAY_TARGET_OFF : tud_suspended() ? HIDWAY_TARGET_ASLEEP : HIDWAY_TARGET_ON;
+    if (t == sent_target && absolute_time_diff_us(next_target, now) < 0)
+        return;
+    uint8_t frame[HIDWAY_COBS_MAX(HIDWAY_SER_TARGET_PAYLOAD_LEN) + 1];
+    size_t n = hidway_serial_build_target(t, frame, sizeof frame);
+    if (n)
+        uart_write_blocking(LINK_UART, frame, n); /* 6 bytes: fits the TX FIFO */
+    sent_target = t;
+    next_target = delayed_by_ms(now, LINK_TARGET_MS);
+}
 
 static void flag_error(absolute_time_t now)
 {
@@ -98,12 +119,16 @@ void link_init(void)
     seen_bad = 0;
     last_bad = error_until = nil_time;
     forget_presses();
+    sent_target = 0xFF;
+    next_target = get_absolute_time();
 }
 
 static void apply_frame(const hidway_serial_state_t *s)
 {
     absolute_time_t now = get_absolute_time();
 
+    if (s->type != HIDWAY_SER_STATE && s->type != HIDWAY_SER_RELEASE)
+        return; /* not input (the Pi never sends anything else) */
     if (s->type == HIDWAY_SER_RELEASE) {
         hid_out_release_all();
         have_base = false; /* next STATE re-baselines, no motion jump */
@@ -147,6 +172,7 @@ void link_task(void)
     }
 
     absolute_time_t now = get_absolute_time();
+    report_target(now);
     if (deframer.bad != seen_bad) { /* corrupt frames: one is noise, two close together a problem */
         seen_bad = deframer.bad;
         if (!is_nil_time(last_bad) && absolute_time_diff_us(last_bad, now) < (int64_t)LINK_BAD_GAP_MS * 1000)

@@ -58,8 +58,8 @@
 #define RATE_LIMIT_PPS    2000 /* accepted packets per second, RELEASE exempt */
 #define POLL_PENDING_MS   1    /* a frame is waiting for the tty to drain */
 
-#define STATUS_FLAG_SERIAL_OPEN 0x0002
-#define STATUS_FLAG_ENCRYPTED   0x0004
+#define TARGET_STALE_MS   10000 /* no report from the Pico for this long: state unknown */
+#define WAKE_MIN_GAP_MS   3000  /* at most one Wake-on-LAN burst per this, on request */
 
 /* Sealed packets must be within this of the relay's wall clock (both ends run
  * NTP); together with "strictly newer" it bounds replays after a restart. */
@@ -141,58 +141,111 @@ static bool parse_mac(const char *s, uint8_t mac[6])
     return true;
 }
 
-/* One-shot: send a Wake-on-LAN magic packet (6 x 0xFF, then the MAC 16 times)
- * over UDP to `to` ("IPv4[:PORT]", default the local broadcast on port 9),
- * three times since UDP may drop one. The address is the target's broadcast
- * address on this network, or a router that forwards the port to the target. */
-static int wake_target(const char *mac_text, const char *to)
+/* A magic packet (6 x 0xFF, then the MAC 16 times) and where it goes: the
+ * target's broadcast address on this network, or a router that forwards the
+ * port to the target. Used by --wake and, in the relay, by the client's WAKE. */
+static struct {
+    bool on;
+    char mac_text[18];
+    uint8_t pkt[6 + 16 * 6];
+    struct sockaddr_in dst;
+    uint64_t last_ms; /* relay: last burst sent on request */
+    bool warned;      /* relay: WAKE asked for but none configured */
+} wake;
+
+/* `to` is "IPv4[:PORT]"; NULL or empty means the local broadcast on port 9. */
+static bool wake_setup(const char *mac_text, const char *to)
 {
     uint8_t mac[6];
     if (!parse_mac(mac_text, mac)) {
         fprintf(stderr, "hidwayd: bad MAC address: %s (use aa:bb:cc:dd:ee:ff)\n", mac_text);
-        return 2;
+        return false;
     }
     char host[64];
     int port = 9;
-    snprintf(host, sizeof host, "%s", to ? to : "255.255.255.255");
+    snprintf(host, sizeof host, "%s", to && *to ? to : "255.255.255.255");
     char *colon = strchr(host, ':');
     if (colon) {
         *colon = 0;
         port = atoi(colon + 1);
     }
-    struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
-    if (port <= 0 || port > 65535 || inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
+    memset(&wake.dst, 0, sizeof wake.dst);
+    wake.dst.sin_family = AF_INET;
+    wake.dst.sin_port = htons((uint16_t)port);
+    if (port <= 0 || port > 65535 || inet_pton(AF_INET, host, &wake.dst.sin_addr) != 1) {
         fprintf(stderr, "hidwayd: bad wake address: %s (use IPv4[:PORT])\n", to ? to : host);
-        return 2;
+        return false;
     }
-
-    uint8_t pkt[6 + 16 * 6];
-    memset(pkt, 0xFF, 6);
+    memset(wake.pkt, 0xFF, 6);
     for (int i = 0; i < 16; i++)
-        memcpy(pkt + 6 + 6 * i, mac, 6);
+        memcpy(wake.pkt + 6 + 6 * i, mac, 6);
+    snprintf(wake.mac_text, sizeof wake.mac_text, "%s", mac_text);
+    wake.on = true;
+    return true;
+}
 
+/* Three copies, since UDP may drop one, `gap_ms` apart. Returns how many went out. */
+static int wake_send(long gap_ms)
+{
     int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     int on = 1;
     if (s < 0 || setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof on) != 0) {
-        perror("hidwayd: wake socket");
         if (s >= 0)
             close(s);
-        return 1;
+        return 0;
     }
     int sent = 0;
     for (int i = 0; i < 3; i++) {
-        if (sendto(s, pkt, sizeof pkt, 0, (const struct sockaddr *)&dst, sizeof dst) == (ssize_t)sizeof pkt)
+        if (i && gap_ms) {
+            struct timespec gap = {0, gap_ms * 1000000L};
+            nanosleep(&gap, NULL);
+        }
+        if (sendto(s, wake.pkt, sizeof wake.pkt, 0, (const struct sockaddr *)&wake.dst, sizeof wake.dst) ==
+            (ssize_t)sizeof wake.pkt)
             sent++;
-        struct timespec gap = {0, 100 * 1000000L};
-        nanosleep(&gap, NULL);
     }
     close(s);
-    if (!sent) {
-        perror("hidwayd: wake sendto");
+    return sent;
+}
+
+static void wake_describe(char *out, size_t cap)
+{
+    char a[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &wake.dst.sin_addr, a, sizeof a);
+    snprintf(out, cap, "%s via %s:%u", wake.mac_text, a, ntohs(wake.dst.sin_port));
+}
+
+/* --wake: one-shot. */
+static int wake_target(const char *mac_text, const char *to)
+{
+    if (!wake_setup(mac_text, to))
+        return 2;
+    if (!wake_send(100)) {
+        perror("hidwayd: wake");
         return 1;
     }
-    printf("hidwayd: magic packet for %s sent to %s:%d\n", mac_text, host, port);
+    char d[64];
+    wake_describe(d, sizeof d);
+    printf("hidwayd: magic packet sent: %s\n", d);
     return 0;
+}
+
+/* WAKE from the client (already authenticated and from the allowed peer):
+ * only ever this configured packet, at most once per WAKE_MIN_GAP_MS. */
+static void handle_wake(uint64_t t)
+{
+    if (!wake.on) {
+        if (!wake.warned)
+            fprintf(stderr, "hidwayd: wake requested, but HIDWAY_WAKE_MAC is not set\n");
+        wake.warned = true;
+        return;
+    }
+    if (wake.last_ms && t - wake.last_ms < WAKE_MIN_GAP_MS)
+        return;
+    wake.last_ms = t;
+    char d[64];
+    wake_describe(d, sizeof d);
+    fprintf(stderr, "hidwayd: wake requested: magic packet %s (%s)\n", wake_send(0) ? "sent" : "FAILED", d);
 }
 
 static bool load_key_file(const char *path)
@@ -296,6 +349,9 @@ typedef struct {
     bool resync;          /* a frame went out partially; start the next with 0x00 */
     hidway_serial_state_t pending;
     uint32_t replaced;    /* states superseded before they were written */
+    hidway_deframer_t rx; /* reports from the Pico */
+    uint8_t target;       /* last HIDWAY_TARGET_* the Pico reported */
+    uint64_t target_ms;   /* when; 0 = no fresh report */
 } serial_link_t;
 
 static speed_t baud_const(int baud)
@@ -317,6 +373,41 @@ static void serial_close(serial_link_t *l, uint64_t t)
     l->have_pending = false;
     l->resync = false;
     l->next_try_ms = t + SERIAL_RETRY_MS;
+    l->target_ms = 0;
+}
+
+/* Target reports from the Pico (it sends one on every change and every few
+ * seconds while it has power). */
+static void serial_read(serial_link_t *l, uint64_t t)
+{
+    uint8_t buf[64];
+    ssize_t n;
+    while (l->fd >= 0 && (n = read(l->fd, buf, sizeof buf)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            hidway_serial_state_t s;
+            if (hidway_deframer_push(&l->rx, buf[i], &s) && s.type == HIDWAY_SER_TARGET) {
+                l->target = s.target;
+                l->target_ms = t ? t : 1;
+            }
+        }
+    }
+}
+
+/* Forget a report that has gone stale (the Pico lost power or the link). */
+static void target_expire(serial_link_t *l, uint64_t t)
+{
+    if (l->target_ms && t - l->target_ms > TARGET_STALE_MS)
+        l->target_ms = 0;
+}
+
+static uint8_t target_state(const serial_link_t *l)
+{
+    return l->fd >= 0 && l->target_ms ? l->target : HIDWAY_TARGET_UNKNOWN;
+}
+
+static const char *target_name(uint8_t t)
+{
+    return t == HIDWAY_TARGET_ON ? "on" : t == HIDWAY_TARGET_ASLEEP ? "asleep" : t == HIDWAY_TARGET_OFF ? "off" : "unknown";
 }
 
 /* Write one frame without blocking. Returns true once it is fully written.
@@ -384,7 +475,7 @@ static void serial_open(serial_link_t *l, uint64_t t)
         return;
     l->next_try_ms = t + SERIAL_RETRY_MS;
 
-    int fd = open(l->dev, O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    int fd = open(l->dev, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         if (errno != l->last_errno)
             fprintf(stderr, "hidwayd: serial %s unavailable (%s), retrying every %d ms\n",
@@ -403,6 +494,8 @@ static void serial_open(serial_link_t *l, uint64_t t)
     }
     l->fd = fd;
     l->last_errno = 0;
+    hidway_deframer_reset(&l->rx);
+    l->target_ms = 0;
     fprintf(stderr, "hidwayd: serial %s open at %d baud\n", l->dev, l->baud);
     serial_send_release(l, 0); /* every connection starts from "nothing held" */
 }
@@ -462,6 +555,7 @@ static void write_state_file(const char *path, const relay_view_t *v, const seri
             !l->dev ? "none" : l->fd >= 0 ? "open" : "closed", l->dev ? l->dev : "",
             (long long)v->last_rx, v->pps, v->frames_ok, v->seq_gaps, v->rate_drops, l->replaced);
     fprintf(f, "crypto=%s\ncrypto_rejected=%u\n", cry.on ? "on" : "off", cry.rejected);
+    fprintf(f, "target=%s\nwake=%s\n", target_name(target_state(l)), wake.on ? "on" : "off");
     if (v->have_session)
         fprintf(f, "session=%08x\n", v->session);
     if (fclose(f) == 0)
@@ -485,6 +579,8 @@ static int poll_timeout(uint64_t t, bool link_up, uint64_t last_pkt_ms, uint64_t
     }
     if (l->dev && l->fd < 0 && l->next_try_ms < deadline)
         deadline = l->next_try_ms;
+    if (l->fd >= 0 && l->target_ms && l->target_ms + TARGET_STALE_MS + 1 < deadline)
+        deadline = l->target_ms + TARGET_STALE_MS + 1; /* to notice the reports stopping */
     if (deadline == UINT64_MAX)
         return -1;
     return deadline > t ? (int)(deadline - t) : 0;
@@ -521,6 +617,13 @@ static int popcount_bitmap(const uint8_t *bm, size_t n)
         for (uint8_t b = bm[i]; b; b &= (uint8_t)(b - 1))
             c++;
     return c;
+}
+
+static uint16_t status_flags(const serial_link_t *l)
+{
+    return (uint16_t)((l->fd >= 0 ? HIDWAY_STATUS_SERIAL_OPEN : 0) | (cry.on ? HIDWAY_STATUS_ENCRYPTED : 0) |
+                      (wake.on ? HIDWAY_STATUS_WAKE : 0) |
+                      (target_state(l) << HIDWAY_STATUS_TARGET_SHIFT));
 }
 
 static void usage(const char *argv0)
@@ -624,6 +727,19 @@ int main(int argc, char **argv)
     fprintf(stderr, "hidwayd: encryption %s\n",
             cry.on ? "ON (XChaCha20-Poly1305, sealed packets only)" : "off (plaintext protocol)");
 
+    /* Wake-on-LAN on the client's request: from hidwayd.conf, which the
+     * service loads into the environment. */
+    const char *wake_env = getenv("HIDWAY_WAKE_MAC");
+    if (wake_env && *wake_env) {
+        if (wake_setup(wake_env, getenv("HIDWAY_WAKE_TO"))) {
+            char d[64];
+            wake_describe(d, sizeof d);
+            fprintf(stderr, "hidwayd: wake-on-LAN on (%s)\n", d);
+        } else {
+            fprintf(stderr, "hidwayd: wake-on-LAN off: fix HIDWAY_WAKE_MAC / HIDWAY_WAKE_TO\n");
+        }
+    }
+
     serial_open(&ser, now_ms());
 
     /* Per-session accounting. */
@@ -643,6 +759,7 @@ int main(int argc, char **argv)
 
     /* Published state; the file is rewritten when one of these changes. */
     bool pub_link = false, pub_serial = ser.fd >= 0, pub_session = false;
+    uint8_t pub_target = HIDWAY_TARGET_UNKNOWN;
     uint32_t pub_session_id = 0;
     bool publish = false;
     relay_view_t initial = {.started = started};
@@ -651,7 +768,7 @@ int main(int argc, char **argv)
     while (running) {
         struct pollfd pfd[2] = {
             {.fd = fd, .events = POLLIN},
-            {.fd = ser.fd, .events = 0}, /* POLLHUP/POLLERR: device gone */
+            {.fd = ser.fd, .events = POLLIN}, /* target reports; POLLHUP/POLLERR: device gone */
         };
         int pr = poll(pfd, ser.fd >= 0 ? 2 : 1,
                       poll_timeout(now_ms(), link_up, last_pkt_ms, next_tick_ms, &ser));
@@ -661,6 +778,9 @@ int main(int argc, char **argv)
             fprintf(stderr, "hidwayd: serial %s disconnected\n", ser.dev);
             serial_close(&ser, t);
         }
+        if (pr > 0 && ser.fd >= 0 && (pfd[1].revents & POLLIN))
+            serial_read(&ser, t);
+        target_expire(&ser, t);
 
         if (pr > 0 && (pfd[0].revents & POLLIN)) {
             uint8_t buf[128];
@@ -676,17 +796,19 @@ int main(int argc, char **argv)
                 /* malformed, forged, replayed or wrong mode: drop */
             } else if (p.type != HIDWAY_MSG_RELEASE && !rate_allow(&rate, t)) {
                 /* over the sanity cap: drop (a RELEASE always passes) */
-            } else if (p.type == HIDWAY_MSG_PROBE) {
-                /* Reachability ping: reply, but do not touch link state,
-                 * the latest input, the serial link or the counters. */
+            } else if (p.type == HIDWAY_MSG_PROBE || p.type == HIDWAY_MSG_WAKE) {
+                /* Reachability ping (and wake request): reply, but do not
+                 * touch link state, the latest input, the serial link or
+                 * the counters. */
+                if (p.type == HIDWAY_MSG_WAKE)
+                    handle_wake(t);
                 hidway_status_pkt_t st = {0};
                 st.session_id = p.session_id;
                 st.seq = last_seq;
                 st.client_time_us = p.client_time_us;
                 st.frames_ok = frames_ok;
                 st.seq_gaps = seq_gaps;
-                st.flags = (ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0) |
-                           (cry.on ? STATUS_FLAG_ENCRYPTED : 0);
+                st.flags = status_flags(&ser);
                 send_status(fd, &st, &from, fromlen);
             } else {
                 bool accept = true;
@@ -729,8 +851,7 @@ int main(int argc, char **argv)
                     st.client_time_us = p.client_time_us;
                     st.frames_ok = frames_ok;
                     st.seq_gaps = seq_gaps;
-                    st.flags = (ser.fd >= 0 ? STATUS_FLAG_SERIAL_OPEN : 0) |
-                               (cry.on ? STATUS_FLAG_ENCRYPTED : 0);
+                    st.flags = status_flags(&ser);
                     st.leds = 0;
                     send_status(fd, &st, &from, fromlen);
                 }
@@ -766,9 +887,10 @@ int main(int argc, char **argv)
             in_pps = in_this_sec = 0;
 
         if (publish || link_up != pub_link || (ser.fd >= 0) != pub_serial ||
-            have_session != pub_session || session != pub_session_id) {
+            have_session != pub_session || session != pub_session_id || target_state(&ser) != pub_target) {
             pub_link = link_up;
             pub_serial = ser.fd >= 0;
+            pub_target = target_state(&ser);
             pub_session = have_session;
             pub_session_id = session;
             publish = false;

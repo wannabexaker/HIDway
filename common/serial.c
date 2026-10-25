@@ -22,8 +22,21 @@ static size_t encode_payload(const hidway_serial_state_t *s, uint8_t *p)
     return i; /* HIDWAY_SER_PAYLOAD_LEN */
 }
 
+static bool decode_target(const uint8_t *p, size_t len, hidway_serial_state_t *s)
+{
+    if (hidway_crc16(p, len - 2) != hidway_rd16(p + len - 2) || p[0] != HIDWAY_SER_TARGET ||
+        p[1] > HIDWAY_TARGET_ON)
+        return false;
+    memset(s, 0, sizeof *s);
+    s->type = HIDWAY_SER_TARGET;
+    s->target = p[1];
+    return true;
+}
+
 static bool decode_payload(const uint8_t *p, size_t len, hidway_serial_state_t *s)
 {
+    if (len == HIDWAY_SER_TARGET_PAYLOAD_LEN)
+        return decode_target(p, len, s);
     if (len != HIDWAY_SER_PAYLOAD_LEN)
         return false;
     size_t body = len - 2;
@@ -40,6 +53,7 @@ static bool decode_payload(const uint8_t *p, size_t len, hidway_serial_state_t *
     s->y = (int32_t)hidway_rd32(p + i); i += 4;
     s->wheel = (int16_t)hidway_rd16(p + i); i += 2;
     s->pan = (int16_t)hidway_rd16(p + i);   i += 2;
+    s->target = 0;
 
     if (s->type == HIDWAY_SER_RELEASE) {
         s->mods = 0;
@@ -57,6 +71,20 @@ size_t hidway_serial_build(const hidway_serial_state_t *s, uint8_t *out, size_t 
     if (cap < HIDWAY_COBS_MAX(plen) + 1)
         return 0;
     size_t n = hidway_cobs_encode(payload, plen, out);
+    out[n++] = 0x00; /* delimiter */
+    return n;
+}
+
+size_t hidway_serial_build_target(uint8_t target, uint8_t *out, size_t cap)
+{
+    uint8_t payload[HIDWAY_SER_TARGET_PAYLOAD_LEN];
+    payload[0] = HIDWAY_SER_TARGET;
+    payload[1] = target;
+    hidway_wr16(payload + 2, hidway_crc16(payload, 2));
+
+    if (cap < HIDWAY_COBS_MAX(sizeof payload) + 1)
+        return 0;
+    size_t n = hidway_cobs_encode(payload, sizeof payload, out);
     out[n++] = 0x00; /* delimiter */
     return n;
 }

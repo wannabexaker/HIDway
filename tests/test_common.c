@@ -264,6 +264,12 @@ static void test_protocol_input(void)
     for (size_t i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
         CHECK(out.keys[i] == 0);
 
+    /* WAKE is a valid message (the relay answers it like a PROBE). */
+    uint8_t wk[HIDWAY_INPUT_PKT_LEN];
+    in.type = HIDWAY_MSG_WAKE;
+    hidway_input_encode(wk, &in);
+    CHECK(hidway_input_decode(wk, sizeof wk, &out) && out.type == HIDWAY_MSG_WAKE);
+
     /* Rejections: wrong length, magic, version, type. */
     CHECK(!hidway_input_decode(buf, HIDWAY_INPUT_PKT_LEN - 1, &out));
     uint8_t bad[HIDWAY_INPUT_PKT_LEN];
@@ -428,6 +434,40 @@ static void test_serial(void)
     CHECK(done && got.mods == 0 && got.buttons == 0);
     for (size_t i = 0; i < HIDWAY_KEY_BITMAP_BYTES; i++)
         CHECK(got.keys[i] == 0);
+
+    /* Pico -> Pi target reports share the deframer with state frames. */
+    uint8_t tf[HIDWAY_SER_FRAME_MAX];
+    size_t tn = hidway_serial_build_target(HIDWAY_TARGET_ASLEEP, tf, sizeof tf);
+    CHECK(tn > 0 && tf[tn - 1] == 0x00);
+    CHECK(hidway_serial_build_target(HIDWAY_TARGET_ON, tf, 3) == 0); /* too small */
+    hidway_deframer_reset(&d);
+    done = false;
+    for (size_t i = 0; i < tn; i++)
+        done = hidway_deframer_push(&d, tf[i], &got);
+    CHECK(done && got.type == HIDWAY_SER_TARGET && got.target == HIDWAY_TARGET_ASLEEP);
+
+    /* ...a state frame right after it still decodes. */
+    s.type = HIDWAY_SER_STATE;
+    n = hidway_serial_build(&s, frame, sizeof frame);
+    done = false;
+    for (size_t i = 0; i < n; i++)
+        done = hidway_deframer_push(&d, frame[i], &got);
+    CHECK(done && got.type == HIDWAY_SER_STATE && got.target == 0);
+
+    /* Corrupt or out-of-range target reports are dropped. */
+    tn = hidway_serial_build_target(HIDWAY_TARGET_ON, tf, sizeof tf);
+    tf[1] ^= 0x01;
+    hidway_deframer_reset(&d);
+    done = false;
+    for (size_t i = 0; i < tn; i++)
+        done = hidway_deframer_push(&d, tf[i], &got);
+    CHECK(!done && d.bad == 1);
+    tn = hidway_serial_build_target(7, tf, sizeof tf);
+    hidway_deframer_reset(&d);
+    done = false;
+    for (size_t i = 0; i < tn; i++)
+        done = hidway_deframer_push(&d, tf[i], &got);
+    CHECK(!done);
 }
 
 /* ------------------------------------------------------------- crypto */

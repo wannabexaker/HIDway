@@ -182,6 +182,20 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   config parsing, bad input, fake-root install, shellcheck clean.
   Next: target power state (on/asleep/off) from the Pico over its TX line and
   a "Wake" button in the client.
+- [~] **28. Target state and Wake in the client** (2026-10-25) — the Pico
+  reports the target over its TX line (new serial frame `HIDWAY_SER_TARGET`:
+  on / asleep / off from USB mount/suspend; on change and every 3 s); the
+  relay reads it (serial now read-write), expires it after 10 s silence
+  (unknown), publishes it in status flags (`HIDWAY_STATUS_*`, backward
+  compatible), the state file and `hidway-status`; new client message
+  `HIDWAY_MSG_WAKE` (allowed peer only, sealed with encryption, only the
+  configured packet, max once per 3 s; config from `HIDWAY_WAKE_*` in
+  hidwayd.conf). Client: "PC" tile (On / Asleep / Off / Off? / Waking) with a
+  WAKE button and a tray item; armed time moved into the header pill;
+  history notes target changes; `hidway-probe` prints the target. Tests:
+  unit (frame round trip, corrupt/out-of-range, WAKE decode), Linux
+  end-to-end with a pty Pico (reports, staleness, wake burst, rate limit),
+  shellcheck, previews. Remaining: flash the Pico 2, release, verify live.
 - [x] **27. Updater: no false "service files changed"** (2026-10-25) — only
   the files `--apply-system` installs count, not examples or docs;
   `.gitattributes` keeps the Linux scripts LF in Windows checkouts.

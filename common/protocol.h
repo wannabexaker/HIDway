@@ -29,8 +29,25 @@ enum {
     HIDWAY_MSG_RELEASE = 2, /* client -> relay: release everything now */
     HIDWAY_MSG_PROBE = 3,   /* client -> relay: reachability ping; NOT forwarded
                                to the Pico and does not affect the link state */
+    HIDWAY_MSG_WAKE = 4,    /* client -> relay: switch the target PC on (Wake-on-LAN);
+                               answered like a PROBE, never forwarded to the Pico */
     HIDWAY_MSG_STATUS = 0x81 /* relay -> client: counters + RTT echo */
 };
+
+/* The target PC as the Pico sees it over USB (status flags and serial link). */
+enum {
+    HIDWAY_TARGET_UNKNOWN = 0, /* no report from the Pico (unpowered, unplugged, no link) */
+    HIDWAY_TARGET_OFF = 1,     /* Pico powered but not enumerated: PC off or booting */
+    HIDWAY_TARGET_ASLEEP = 2,  /* USB suspended: PC asleep */
+    HIDWAY_TARGET_ON = 3,
+};
+
+/* hidway_status_pkt_t.flags */
+#define HIDWAY_STATUS_SERIAL_OPEN  0x0002 /* the relay's serial link to the Pico is open */
+#define HIDWAY_STATUS_ENCRYPTED    0x0004 /* the relay requires sealed packets */
+#define HIDWAY_STATUS_WAKE         0x0008 /* the relay can switch the target on */
+#define HIDWAY_STATUS_TARGET_SHIFT 4      /* bits 4-5: HIDWAY_TARGET_* */
+#define HIDWAY_STATUS_TARGET_MASK  0x0030
 
 /* Full input state plus its header. */
 typedef struct {
@@ -56,7 +73,7 @@ typedef struct {
     uint32_t client_time_us; /* echo for RTT = now - this */
     uint32_t frames_ok;      /* input packets accepted since start */
     uint16_t seq_gaps;       /* detected gaps in seq (loss/reorder estimate) */
-    uint16_t flags;          /* bit0 usb_mounted, bit1 armed (future) */
+    uint16_t flags;          /* HIDWAY_STATUS_* */
     uint8_t leds;            /* host keyboard LEDs (future) */
 } hidway_status_pkt_t;
 
@@ -112,7 +129,8 @@ static inline bool hidway_input_decode(const uint8_t *in, size_t len, hidway_inp
     if (len != HIDWAY_INPUT_PKT_LEN || in[0] != HIDWAY_PROTO_MAGIC || in[1] != HIDWAY_PROTO_VER)
         return false;
     uint8_t type = in[2];
-    if (type != HIDWAY_MSG_STATE && type != HIDWAY_MSG_RELEASE && type != HIDWAY_MSG_PROBE)
+    if (type != HIDWAY_MSG_STATE && type != HIDWAY_MSG_RELEASE && type != HIDWAY_MSG_PROBE &&
+        type != HIDWAY_MSG_WAKE)
         return false;
 
     size_t i = 2;

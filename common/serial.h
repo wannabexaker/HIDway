@@ -17,8 +17,9 @@
 #include "hidway_kbd.h"
 
 enum {
-    HIDWAY_SER_STATE = 1,
-    HIDWAY_SER_RELEASE = 2,
+    HIDWAY_SER_STATE = 1,     /* Pi -> Pico */
+    HIDWAY_SER_RELEASE = 2,   /* Pi -> Pico */
+    HIDWAY_SER_TARGET = 0x81, /* Pico -> Pi: the target PC's state (HIDWAY_TARGET_*) */
 };
 
 typedef struct {
@@ -29,9 +30,15 @@ typedef struct {
     uint8_t buttons;
     int32_t x, y;        /* cumulative mouse counters */
     int16_t wheel, pan;  /* cumulative wheel / AC Pan */
+    uint8_t target;      /* HIDWAY_SER_TARGET only: HIDWAY_TARGET_* */
 } hidway_serial_state_t;
 
 #define HIDWAY_SER_PAYLOAD_LEN (1 + 2 + 1 + HIDWAY_KEY_BITMAP_BYTES + 1 + 8 + 4 + 2) /* +crc = 40 */
+#define HIDWAY_SER_TARGET_PAYLOAD_LEN (1 + 1 + 2) /* type, state, crc */
+
+/* Pico -> Pi: frame a report of the target PC's state (HIDWAY_TARGET_*).
+ * Returns the framed length, or 0 if `cap` is too small. */
+size_t hidway_serial_build_target(uint8_t target, uint8_t *out, size_t cap);
 #define HIDWAY_SER_FRAME_MAX   (HIDWAY_COBS_MAX(HIDWAY_SER_PAYLOAD_LEN) + 1)         /* +delimiter */
 
 /* Build a framed message (COBS + trailing 0x00) into `out`.

@@ -114,7 +114,9 @@ focus, and can be dragged anywhere) or with Ctrl+Shift+F12; the same hotkey
 disarms. Anything that takes the focus away, locks the PC, changes the display
 or drops the link disarms automatically and releases everything on the
 target. Nothing is read while disarmed, and input injected by software on this
-PC is never relayed. For a mouse without side buttons, `mouse4_key` /
+PC is never relayed. The **PC** tile shows whether the target is on, asleep or
+off (the Pico reports it), and offers **WAKE** when the relay is set up for
+Wake-on-LAN. For a mouse without side buttons, `mouse4_key` /
 `mouse5_key` in `hidway.ini` let a key act as that button (held while held).
 
 For the picture, any remote-desktop or game-streaming client works with its

@@ -150,7 +150,7 @@ int main(int argc, char **argv)
            crypto ? "end-to-end encrypted" : "plaintext", count, interval_ms);
 
     uint32_t *rtt = (uint32_t *)calloc((size_t)count, sizeof *rtt);
-    int got = 0, rejected = 0, serial_open = 0, relay_encrypted = 0;
+    int got = 0, rejected = 0, serial_open = 0, relay_encrypted = 0, target = 0, can_wake = 0;
     if (!rtt)
         return 1;
 
@@ -198,8 +198,10 @@ int main(int argc, char **argv)
                 continue;
             if (got < count)
                 rtt[got++] = hidway_now_us() - s.client_time_us;
-            serial_open = (s.flags & 0x0002) != 0;
-            relay_encrypted = (s.flags & 0x0004) != 0;
+            serial_open = (s.flags & HIDWAY_STATUS_SERIAL_OPEN) != 0;
+            relay_encrypted = (s.flags & HIDWAY_STATUS_ENCRYPTED) != 0;
+            can_wake = (s.flags & HIDWAY_STATUS_WAKE) != 0;
+            target = (s.flags & HIDWAY_STATUS_TARGET_MASK) >> HIDWAY_STATUS_TARGET_SHIFT;
         }
     }
     hidway_net_close();
@@ -218,8 +220,9 @@ int main(int argc, char **argv)
         printf("rtt ms   min %.1f   p50 %.1f   avg %.1f   p95 %.1f   max %.1f\n",
                rtt[0] / 1000.0, rtt[got / 2] / 1000.0, sum / got / 1000.0,
                rtt[(int)((got - 1) * 0.95)] / 1000.0, rtt[got - 1] / 1000.0);
-        printf("relay: encryption %s, serial %s\n", relay_encrypted ? "on" : "off",
-               serial_open ? "open" : "not open");
+        static const char *tn[] = {"unknown", "off", "asleep", "on"};
+        printf("relay: encryption %s, serial %s, target PC %s%s\n", relay_encrypted ? "on" : "off",
+               serial_open ? "open" : "not open", tn[target & 3], can_wake ? ", wake-on-LAN ready" : "");
     } else {
         printf("no reply: relay down, wrong address/port, or the two ends disagree on the key\n");
     }

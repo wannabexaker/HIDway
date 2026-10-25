@@ -444,7 +444,9 @@ cmd_status() { # cmd_status <short>
 
     if [[ $short == 1 ]]; then
         local s="HIDway $summary"
-        [[ $active == active ]] && s+=" | ${version:-?} | $([[ $link == up ]] && echo live || echo idle) | serial ${serial:-?}"
+        local tg
+        tg=$(state_field target)
+        [[ $active == active ]] && s+=" | ${version:-?} | $([[ $link == up ]] && echo live || echo idle) | serial ${serial:-?} | PC ${tg:-?}"
         s+=" | updates: ${result:-not checked yet}"
         echo "$s"
         return "$level"
@@ -464,6 +466,14 @@ cmd_status() { # cmd_status <short>
         closed) printf '  serial    %s not connected (retrying every second)\n' "$dev" ;;
         *) printf '  serial    none configured\n' ;;
         esac
+        local target wake
+        target=$(state_field target)
+        wake=$(state_field wake)
+        case $target in
+        on | asleep | off) printf '  target    PC %s (reported by the Pico)' "$target" ;;
+        *) printf '  target    unknown (no report from the Pico: PC off, or Pico unplugged)' ;;
+        esac
+        [[ $wake == on ]] && printf '; wake-on-LAN ready\n' || printf '\n'
     else
         printf '  relay     %s  (journalctl -u hidwayd -n 50)\n' "${active:-unknown}"
     fi

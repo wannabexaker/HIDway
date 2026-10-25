@@ -110,12 +110,13 @@ int WINAPI GdipDrawLines(void *graphics, void *pen, const HW_PointF *points, int
 #define KEYF_E0 0x10000
 #define KEYF_UP 0x20000
 #define BADGE_FADE_MS 2500u
+#define WAKE_WAIT_MS 180000u /* show "Waking..." this long after a wake request */
 #define WIN_STYLE (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN)
 
 enum {
     ID_HISTORY = 1001, ID_CLEAR, ID_TARGET, ID_PORT, ID_RATE, ID_AUTO,
     ID_CB_KBD, ID_CB_MOUSE, ID_CB_HIST, ID_SAVE, ID_ARM, ID_PANIC,
-    IDM_ARM, IDM_PANIC, IDM_SHOW, IDM_BADGE, IDM_QUIT
+    IDM_ARM, IDM_PANIC, IDM_WAKE, IDM_SHOW, IDM_BADGE, IDM_QUIT
 };
 
 enum { BTN_L = 1, BTN_R = 2, BTN_M = 4, BTN_X1 = 8, BTN_X2 = 16 };
@@ -200,6 +201,9 @@ static struct {
     uint16_t pi_gaps;
     uint16_t pi_flags;
     int status_seen;
+    uint32_t wake_sent_ms; /* last wake request, 0 = none pending */
+    int shown_target;      /* last target state written to the history */
+    int wake_hot;          /* pointer over the TARGET PC tile while it offers wake */
     int ever_status;
     uint32_t last_status_us;
     uint32_t armed_at_ms;
@@ -613,6 +617,36 @@ static void net_probe(void)
     net_drain_status();
 }
 
+/* The target PC as the relay last reported it (from the Pico), or -1
+ * without a recent reply. */
+static int target_state(void)
+{
+    if (!link_recent())
+        return -1;
+    return (g.pi_flags & HIDWAY_STATUS_TARGET_MASK) >> HIDWAY_STATUS_TARGET_SHIFT;
+}
+
+static int waking(void)
+{
+    return g.wake_sent_ms && timeGetTime() - g.wake_sent_ms < WAKE_WAIT_MS && target_state() != HIDWAY_TARGET_ON;
+}
+
+/* The relay can wake the target, and it is not on. */
+static int wake_offered(void)
+{
+    return link_recent() && (g.pi_flags & HIDWAY_STATUS_WAKE) && target_state() != HIDWAY_TARGET_ON;
+}
+
+static void send_wake(void)
+{
+    if (!wake_offered() || g.preview)
+        return;
+    net_send_state(HIDWAY_MSG_WAKE);
+    g.wake_sent_ms = timeGetTime();
+    history_add('i', "Wake sent to the target PC");
+    invalidate_readouts();
+}
+
 /* ======================================================================== */
 /*  Tray                                                                    */
 /* ======================================================================== */
@@ -735,6 +769,19 @@ static void monitor(void)
         net_probe();
     else
         net_drain_status();
+
+    /* Note changes of the target PC's state (and the end of a wake wait). */
+    int ts = target_state();
+    if (ts >= 0 && ts != g.shown_target) {
+        static const char *names[] = {"no report from the Pico", "off", "asleep", "on"};
+        char line[64];
+        snprintf(line, sizeof line, "Target PC: %s", names[ts & 3]);
+        if (g.shown_target != 0 || ts != HIDWAY_TARGET_UNKNOWN)
+            history_add('i', line);
+        g.shown_target = ts;
+        if (ts == HIDWAY_TARGET_ON)
+            g.wake_sent_ms = 0;
+    }
 
     int up = g.armed && link_recent();
     if (g.prev_link_up && !up && g.armed) {
@@ -1445,7 +1492,7 @@ static void compute_layout(void)
     L->title_x = S(P + 42);
     L->title_y = S(15);
     L->sub_y = S(38);
-    L->pill = R(W - P - 122, 20, W - P, 46);
+    L->pill = R(W - P - 140, 20, W - P, 46);
 
     /* CONNECTION: title row + four stat tiles */
     L->stats = R(P, 64, W - P, 164);
@@ -1611,7 +1658,14 @@ static void paint_header(HDC dc)
     COLORREF bd = g.armed ? C_LIVE_BD : C_FIELD_BD;
     COLORREF dc_ = g.armed ? C_LIVE : C_TEXT3;
     COLORREF tx = g.armed ? C_LIVE_TX : C_TEXT2;
-    const char *label = g.armed ? "ARMED" : "DISARMED";
+    char label[32] = "DISARMED";
+    if (g.armed) { /* with how long it has been armed */
+        unsigned s = (timeGetTime() - g.armed_at_ms) / 1000;
+        if (s < 3600)
+            snprintf(label, sizeof label, "ARMED %02u:%02u", s / 60, s % 60);
+        else
+            snprintf(label, sizeof label, "ARMED %u:%02u:%02u", s / 3600, s / 60 % 60, s % 60);
+    }
     round_rect(dc, p, (p.bottom - p.top) / 2, fill, bd);
 
     SetTextCharacterExtra(dc, S(1));
@@ -1650,7 +1704,7 @@ static void paint_stats(HDC dc)
         else if (g.ever_status || g.probes_unanswered > 5) { sc = C_WARN; st = "no reply from relay"; }
         else { sc = C_TEXT3; st = "probing relay"; }
     } else if (!g.status_seen) { sc = C_AMBER; st = "waiting for relay"; }
-    else if (link_recent()) { sc = C_LIVE; st = (g.pi_flags & 0x0002) ? "linked · serial open" : "linked · no serial"; }
+    else if (link_recent()) { sc = C_LIVE; st = (g.pi_flags & HIDWAY_STATUS_SERIAL_OPEN) ? "linked · serial open" : "linked · no serial"; }
     else { sc = C_WARN; st = "link lost"; }
 
     char addr[160];
@@ -1669,7 +1723,6 @@ static void paint_stats(HDC dc)
     /* tiles */
     char v[4][32];
     int live[4] = {0, 0, 0, 0};
-    unsigned secs = g.armed ? (timeGetTime() - g.armed_at_ms) / 1000 : 0;
     if ((g.armed && g.status_seen) || (!g.armed && link_recent())) {
         snprintf(v[0], 32, "%d ms", g.rtt_ms);
         live[0] = 1;
@@ -1680,14 +1733,30 @@ static void paint_stats(HDC dc)
         live[1] = 1;
     } else strcpy(v[1], "—");
     if (g.armed) { snprintf(v[2], 32, "%u/s", g.pps); live[2] = 1; } else strcpy(v[2], "—");
-    if (g.armed) { snprintf(v[3], 32, "%02u:%02u", secs / 60, secs % 60); live[3] = 1; } else strcpy(v[3], "—");
 
-    static const char *names[4] = {"RTT", "LOSS", "RATE", "ARMED FOR"};
+    /* TARGET PC: as the Pico sees it over USB, reported through the relay */
+    int ts = target_state();
+    COLORREF tc = C_TEXT2;
+    if (ts < 0) { strcpy(v[3], "—"); tc = C_TEXT3; }
+    else if (waking()) { strcpy(v[3], "Waking"); tc = C_AMBER; }
+    else if (ts == HIDWAY_TARGET_ON) { strcpy(v[3], "On"); tc = C_LIVE_TX; }
+    else if (ts == HIDWAY_TARGET_ASLEEP) { strcpy(v[3], "Asleep"); tc = C_AMBER; }
+    else if (ts == HIDWAY_TARGET_OFF) strcpy(v[3], "Off");
+    else strcpy(v[3], "Off?"); /* no report: Pico without power (PC off) or unplugged */
+
+    static const char *names[4] = {"RTT", "LOSS", "RATE", "PC"};
     for (int i = 0; i < 4; i++) {
         RECT t = L->tiles[i];
-        round_rect(dc, t, S(8), C_TILE, C_TILE);
+        int hot = i == 3 && g.wake_hot && wake_offered();
+        round_rect(dc, t, S(8), hot ? C_SEC_H : C_TILE, hot ? C_FOCUS_BD : C_TILE);
         tracked(dc, g.f_section, C_TEXT3, t.left + S(11), t.top + S(8), names[i]);
-        text_at(dc, g.f_tile, live[i] ? C_TEXT : C_TEXT3, t.left + S(11), t.top + S(23), v[i]);
+        text_at(dc, g.f_tile, i == 3 ? tc : live[i] ? C_TEXT : C_TEXT3, t.left + S(11), t.top + S(23), v[i]);
+    }
+    /* A click on the tile wakes the target; the chip says so. */
+    if (wake_offered() && !waking()) {
+        RECT t = L->tiles[3];
+        int cw = text_w(dc, g.f_chip, "WAKE") + 2 * S(8);
+        chip(dc, t.right - S(8) - cw, t.top + S(15), S(18), "WAKE", C_LIVE_F, C_LIVE_BD, C_LIVE_TX);
     }
 }
 
@@ -2162,9 +2231,11 @@ static void preview_fill(void)
     g.crypto_on = 1;
     g.key_error = 0;
     g.last_status_us = hidway_now_us();
-    if (g.preview == 1) {
+    if (g.preview == 1) { /* disarmed, target off: offers wake */
         g.ever_status = 1;
         g.rtt_ms = 91;
+        g.pi_flags = HIDWAY_STATUS_SERIAL_OPEN | HIDWAY_STATUS_WAKE |
+                     (HIDWAY_TARGET_OFF << HIDWAY_STATUS_TARGET_SHIFT);
     } else {
         g.armed = 1;
         g.status_seen = g.ever_status = 1;
@@ -2172,7 +2243,8 @@ static void preview_fill(void)
         g.pps = 250;
         g.pi_frames_ok = 48213;
         g.pi_gaps = 2;
-        g.pi_flags = 0x0002;
+        g.pi_flags = HIDWAY_STATUS_SERIAL_OPEN | HIDWAY_STATUS_WAKE |
+                     (HIDWAY_TARGET_ON << HIDWAY_STATUS_TARGET_SHIFT);
         g.armed_at_ms = timeGetTime() - 83000;
         g.modifiers = 0x02;
         hidway_bitmap_set(g.keys, 0x1A); /* W */
@@ -2323,8 +2395,37 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetFocus(g.edit[i]);
                 SendMessageA(g.edit[i], EM_SETSEL, 0, -1);
             }
+        if (PtInRect(&g.L.tiles[3], pt))
+            send_wake(); /* only when the tile offers it */
         return 0;
     }
+
+    /* The PC tile is a button while it offers wake: hand cursor and hover. */
+    case WM_MOUSEMOVE: {
+        POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        int hot = PtInRect(&g.L.tiles[3], pt) && wake_offered();
+        if (hot != g.wake_hot) {
+            g.wake_hot = hot;
+            if (hot) {
+                TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&t);
+            }
+            invalidate_readouts();
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g.wake_hot) {
+            g.wake_hot = 0;
+            invalidate_readouts();
+        }
+        return 0;
+    case WM_SETCURSOR:
+        if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT && g.wake_hot && wake_offered()) {
+            SetCursor(LoadCursor(NULL, IDC_HAND));
+            return TRUE;
+        }
+        break;
 
     case WM_NET_READ:
         net_drain_status();
@@ -2337,6 +2438,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HMENU m = CreatePopupMenu();
             AppendMenuA(m, MF_STRING, IDM_ARM, g.armed ? "Disarm" : "Arm");
             AppendMenuA(m, MF_STRING, IDM_PANIC, "Panic - release all");
+            AppendMenuA(m, MF_STRING | (wake_offered() ? 0 : MF_GRAYED), IDM_WAKE, "Wake target PC");
             AppendMenuA(m, MF_SEPARATOR, 0, NULL);
             AppendMenuA(m, MF_STRING, IDM_SHOW, IsWindowVisible(hwnd) ? "Hide window" : "Show window");
             AppendMenuA(m, MF_STRING | (g.cfg.badge ? MF_CHECKED : 0), IDM_BADGE, "Show badge (click to arm)");
@@ -2393,6 +2495,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDM_ARM: set_armed(!g.armed); return 0;
         case IDM_PANIC: set_armed(0); history_add('w', "PANIC - all released"); return 0;
+        case IDM_WAKE: send_wake(); return 0;
         case IDM_SHOW: show_main_window(!IsWindowVisible(hwnd)); return 0;
         case IDM_BADGE:
             g.cfg.badge = !g.cfg.badge;
