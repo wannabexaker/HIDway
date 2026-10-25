@@ -133,6 +133,46 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   sees mouse button 4/5 held for as long as the key is held (1:1). New key
   names: grave, capslock, rctrl, ralt, apps, scrolllock, pause. Badge: larger,
   red dot when disarmed, green when armed. Verified by the user (Mouse 4).
+- [x] **22. Remote play from outside (direct path)** — DONE 2026-10-25, with
+  no router changes: from a phone hotspot Tailscale went direct to both the Pi
+  and the target PC (RTT avg ~40 ms, `hidway-probe` 60/60 p50 37 ms vs 94 ms
+  over DERP before). Port forwards turned out unnecessary (and with an
+  "easy" home NAT Tailscale would not advertise them anyway); the fallback if
+  a network ever forces DERP is a Tailscale Peer Relay on the Pi. Moonlight
+  reaches the target by its tailnet address; on mobile data the stream needs
+  ~10 Mbps (20 Mbps congested the link and the control channel timed out).
+  The target PC's Tailscale uses a fixed UDP port and the user starts it
+  manually (not unattended). SSH to the target PC: key-only, LAN + tailnet
+  only (laptop alias `gamingpc`). Original analysis, measured 2026-10-25:
+  home has a public dynamic IPv4 (no CGNAT), endpoint-independent NAT, no
+  UPnP/NAT-PMP, no IPv6; the Pi sits behind the ISP router only, the target
+  PC and this PC behind a second router (double NAT); the target PC is in the
+  tailnet but offline. Without a direct path the stream would ride DERP
+  (throughput-limited, not fit for ~20 Mbps video). Plan: target PC Tailscale
+  always on ("run unattended") with a fixed UDP port; on the ISP router UDP
+  41641 -> Pi and a second UDP port -> the second router; on the second router
+  that port -> target PC plus a static lease; Moonlight adds the target by its
+  tailnet address; test on a phone hotspot (`tailscale ping` = direct,
+  `hidway-probe`, Moonlight stats). Nothing but Tailscale's encrypted UDP is
+  exposed. Limit: networks that block UDP cannot carry the video.
+- [x] **23. Audio over Moonlight** (2026-10-25) — no sound at first: the
+  target's default output is a Voicemeeter virtual device, so with
+  Moonlight's "mute host PC speakers" Sunshine captured its own virtual sink
+  while the game kept playing into Voicemeeter. Fix: turn that Moonlight
+  option off, so Sunshine captures the default device. Verified by the user.
+- [x] **26. Security review of the branch** (2026-10-25) — crypto envelope,
+  relay mode enforcement, client capture/hook, config parsing, firmware link,
+  photos: no vulnerability at confidence >= 8. Defense-in-depth idea for
+  later: persist the relay's replay timestamp (or reject packets older than
+  the relay's start) so a restart cannot reopen a 2-minute replay window.
+- [ ] **24. Guided setup for new users** — Windows installer for the client,
+  then a setup wizard: (1) install on this PC, (2) find the Raspberry Pi on the
+  network and install the relay over SSH, filling in the addresses, (3) "plug
+  the Pico in holding BOOTSEL" and flash the right firmware for the detected
+  board (Pico / Pico 2, W or not), (4) end-to-end check. Publish prebuilt
+  client and firmware files with each release.
+- [ ] **25. Wake-on-LAN** — wake the target PC from the Pi for remote use
+  while it is off or asleep.
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,
