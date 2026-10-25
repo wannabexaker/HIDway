@@ -1,0 +1,162 @@
+# Builds and tests everything: host unit tests, the relay, the install.sh
+# tests, the Windows client and the firmware for every board. Pushes also
+# assemble the release files (kept for one day); release.yml calls this
+# workflow with release: true and publishes them.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+    inputs:
+      release:
+        description: Hand the release files over to the calling workflow
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (unit tests, relay, install.sh)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Host unit tests (gcc)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Relay build and make check
+        run: make -C relay CFLAGS='-O2 -Wall -Wextra -std=c11 -Werror' hidwayd check
+
+      - name: install.sh tests
+        run: bash tests/deploy/test_install.sh
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck relay/deploy/install.sh relay/deploy/uninstall.sh relay/deploy/hidway-update \
+            relay/deploy/hidway-wake relay/deploy/60-hidway tests/deploy/test_install.sh tools/ci/*.sh
+
+  windows:
+    name: Windows (client, probe, unit tests)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build (MSVC)
+        run: |
+          cmake -S . -B build -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build --config Release --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Setup script parses
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              "$PWD\tools\setup\hidway-setup.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { "::error::$_" }; exit 1 }
+
+      - name: Hand over the binaries
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: |
+            build/client/Release/hidway-client.exe
+            build/client/Release/hidway-probe.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  firmware:
+    name: Firmware (Pico, Pico W, Pico 2, Pico 2 W)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Arm toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+
+      - name: Pico SDK (version from firmware/CMakeLists.txt)
+        run: |
+          ver=$(sed -n 's/.*HIDWAY_PICO_SDK_VERSION "\([0-9.]*\)".*/\1/p' firmware/CMakeLists.txt)
+          sdk=$RUNNER_TEMP/pico-sdk
+          git clone --quiet --depth 1 --branch "$ver" https://github.com/raspberrypi/pico-sdk.git "$sdk"
+          git -C "$sdk" submodule update --quiet --init --depth 1 lib/tinyusb lib/cyw43-driver
+          echo "PICO_SDK_PATH=$sdk" >>"$GITHUB_ENV"
+
+      - name: Build
+        run: bash tools/ci/build-firmware.sh firmware-out
+
+      - name: Hand over the firmware
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware
+          path: firmware-out/*.uf2
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Release files
+    if: github.event_name != 'pull_request'
+    needs: [linux, windows, firmware]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows
+          path: dist/windows
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmware
+          path: dist/firmware
+
+      - name: Package
+        env:
+          RELEASE_TAG: ${{ inputs.release && github.ref_name || '' }}
+        run: |
+          version=${RELEASE_TAG:-$(git describe --tags --always)}
+          bash tools/ci/package.sh "$version" dist/windows dist/firmware release
+          {
+            echo "### Release files for $version"
+            echo '```'
+            cat release/SHA256SUMS.txt
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Hand over the release files
+        if: inputs.release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 1

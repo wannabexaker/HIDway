@@ -1,6 +1,6 @@
 # HIDway
 
-Remote physical keyboard/mouse: remote Windows PC → Tailscale (UDP) → Raspberry Pi relay → USB serial → Pico (W) acting as a standard USB HID keyboard + mouse → target PC. The target PC runs no extra software or drivers. Full design: `docs/ARCHITECTURE.md`.
+Remote physical keyboard/mouse: remote Windows PC → Tailscale (UDP) → Raspberry Pi relay → UART (Pi GPIO or USB serial) → Pico / Pico 2 acting as a standard USB HID keyboard + mouse → target PC. The target PC runs no extra software or drivers. Full design: `docs/ARCHITECTURE.md`.
 
 ## Permanent rules (never relax — security and professionalism come first)
 
@@ -35,11 +35,18 @@ These rules are standing policy for the whole project:
 - `client/`: Win32 GUI, built with the host CMake build on Windows.
 - `tests/`: host tests for `common/`, run with ctest.
 - `tools/build.ps1`: builds firmware and tests (uses VS vcvars, `~/.pico-sdk`).
+- `tools/setup/`: `Setup.cmd` / `hidway-setup.ps1`, the Windows installer
+  (per-PC checklist: HIDway, Tailscale, Moonlight, Sunshine via winget).
+- `tools/ci/`: firmware-for-every-board and release-packaging scripts, used by
+  `.github/workflows/` (`ci.yml` on every push/PR, `release.yml` on tags).
 
 ## Releases
 The Pi deploys release tags `vX.Y.Z` only (annotated, on `main`); pushes to
 `main` never reach it. Tag only a commit whose `make check` passes. Branches
 `backup/*` are safety snapshots: never delete or rewrite them.
+Each tag also gets a GitHub release built by `release.yml` (Windows zip with
+`Setup.cmd`, firmware `.uf2` per board, `SHA256SUMS.txt`); it refuses
+lightweight tags and tags not on `main`.
 
 ## Build
 - Host tests + client (Windows): `powershell -ExecutionPolicy Bypass -File tools\build.ps1`
@@ -48,6 +55,4 @@ The Pi deploys release tags `vX.Y.Z` only (annotated, on `main`); pushes to
   with `sudo relay/deploy/install.sh`
 
 ## Status
-See `docs/CHECKLIST.md`. Phase 0 (go/no-go) still needs the on-device T0 result
-before the HID path is proven. Step 1 (UDP transport over Tailscale) is done and
-validated. Serial link (Pi↔Pico) is the next unimplemented piece.
+See `docs/CHECKLIST.md` (the single source of truth for what is done and next).

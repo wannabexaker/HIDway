@@ -78,8 +78,12 @@ as_build() {
 git_src() { as_build git -C "$SRC" "$@"; }
 checkout() { git_src -c advice.detachedHead=false checkout --quiet --force --detach "$1"; }
 
+# "A && B || true" here and below on purpose: never fail, empty when missing.
+# shellcheck disable=SC2015
 field() { [[ -r $1 ]] && sed -n "/^$2=/{s///p;q}" "$1" || true; } # field <file> <key>
 release_field() { field "$1/RELEASE" "$2"; }
+# shellcheck disable=SC2015
+current_commit() { [[ -n $1 ]] && release_field "$1" commit || true; } # current_commit <release dir>|""
 state_field() { field "$STATE_FILE" "$1"; }
 link_target() { readlink "$1" 2>/dev/null || true; }
 list_releases() { # newest first
@@ -284,7 +288,7 @@ cmd_update() { # cmd_update <force>
 
     target=$(fetch_commit "$name")
     cur=$(link_target "$CURRENT")
-    cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+    cur_commit=$(current_commit "$cur")
 
     if [[ $target == "$cur_commit" ]] || ! changed "$cur_commit" "$target" relay common tests; then
         log "up to date ($(release_field "$cur" version))"
@@ -320,7 +324,7 @@ cmd_check() {
     name=${up%% *}
     target=$(fetch_commit "$name")
     cur=$(link_target "$CURRENT")
-    cur_commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+    cur_commit=$(current_commit "$cur")
     if [[ $target != "$cur_commit" ]] && changed "$cur_commit" "$target" relay common tests; then
         echo "update available: $(git_src describe --always --tags "$target")"
         return 10
@@ -353,7 +357,7 @@ cmd_rollback() {
 cmd_apply_system() {
     local cur commit
     cur=$(link_target "$CURRENT")
-    commit=$([[ -n $cur ]] && release_field "$cur" commit || true)
+    commit=$(current_commit "$cur")
     [[ -n $commit ]] || die "no release installed yet"
     checkout "$commit"
     (
@@ -503,7 +507,7 @@ cmd_status() { # cmd_status <short>
 }
 
 # Anything that fails without its own message still leaves a record.
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 on_exit() {
     local rc=$?
     if ((rc != 0)) && [[ $(field "$UPDATE_STATUS" run) != "$$" ]]; then
