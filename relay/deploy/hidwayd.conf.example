@@ -1,6 +1,8 @@
 # HIDway relay settings, read by hidwayd.service.
 # Installed as /etc/hidway/hidwayd.conf (never overwritten by updates).
 # Replace every <placeholder>, then: sudo systemctl enable --now hidwayd
+# (or let the installer do it, e.g.
+#  sudo relay/deploy/install.sh --configure --bind auto --allow <client-tailscale-ip>)
 
 # Tailscale address of this Pi; hidwayd listens on this address only.
 HIDWAY_BIND=<pi-tailscale-ip>

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # install.sh - set up the HIDway relay on a Raspberry Pi (Raspberry Pi OS / Debian).
 #
-#   sudo relay/deploy/install.sh [--ref latest-tag|BRANCH] [--repo URL]
+#   sudo relay/deploy/install.sh [--ref latest-tag|BRANCH] [--repo URL] [settings]
+#   sudo relay/deploy/install.sh --configure [settings]   # change an installation
 #
-# Safe to run again at any time. It never overwrites /etc/hidway/*.conf, and
-# backs up every file it replaces (and the current config) under
-# /var/backups/hidway/<timestamp>/ first.
+# settings (written to /etc/hidway/hidwayd.conf; others are left as they are):
+#   --bind IP|auto       Tailscale address of this Pi (auto: ask Tailscale)
+#   --allow IP           Tailscale address of the PC you play from
+#   --uart gpio|usb      gpio: Pico wired to the Pi 4's GPIO UART3 (enabled
+#                        now and kept after reboots); usb: Debug Probe/adapter
+#   --serial DEV         serial device, if not /dev/hidway-serial
+#   --wake-mac MAC       Wake-on-LAN: the target PC's MAC address
+#   --wake-to IP[:PORT]  Wake-on-LAN: where to send it (see docs/RELAY.md)
+#
+# Safe to run again at any time. It changes /etc/hidway/*.conf only for the
+# settings given, and backs up every file it replaces (and the current
+# config) under /var/backups/hidway/<timestamp>/ first.
 #
 # What it sets up:
 #   users     hidway (runs the relay), hidway-build (fetches and builds)
@@ -13,7 +23,7 @@
 #   /opt/hidway/releases   built releases; current/previous are symlinks
 #   /etc/hidway/           hidwayd.conf, update.conf
 #   systemd   hidwayd.service, hidway-update.timer (daily release check)
-#   udev      /dev/hidway-serial for the Raspberry Pi Debug Probe
+#   udev      /dev/hidway-serial for the Debug Probe or the Pi 4 GPIO UART3
 #   commands  /usr/local/sbin/hidway-update, /usr/local/bin/hidway-status,
 #             /usr/local/bin/hidway-wake
 #   login     one status line (/etc/update-motd.d/60-hidway)
@@ -26,6 +36,8 @@ umask 022
 ROOT=${HIDWAY_ROOT:-} # prefix, for testing only
 SYSTEMCTL=${HIDWAY_SYSTEMCTL:-systemctl}
 UDEVADM=${HIDWAY_UDEVADM:-udevadm}
+TAILSCALE=${HIDWAY_TAILSCALE:-tailscale}
+MODEL_FILE=${HIDWAY_MODEL_FILE:-/proc/device-tree/model}
 HOME_DIR=$ROOT/opt/hidway
 SRC=$HOME_DIR/src
 ETC=$ROOT/etc/hidway
@@ -40,6 +52,8 @@ REF=latest-tag
 REPO_SET=0
 REF_SET=0
 CHANGED=0
+CONF_KV=() # KEY=value settings for hidwayd.conf, from the command line
+UART=
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
@@ -74,6 +88,7 @@ backup() { # backup <path> -> /var/backups/hidway/<stamp>/<path>
 }
 
 prune_backups() {
+    [[ -d $BACKUPS ]] || return 0
     find "$BACKUPS" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r |
         tail -n +$((BACKUP_KEEP + 1)) | while read -r d; do rm -rf -- "${BACKUPS:?}/$d"; done
 }
@@ -91,11 +106,106 @@ put_conf() { # put_conf <example> <dest> [KEY=value...]
     shift 2
     tmp=$(mktemp)
     if [[ -e $dest ]]; then cat "$dest" >"$tmp"; else cat "$example" >"$tmp"; fi
-    for kv in "$@"; do
-        sed -i "s|^${kv%%=*}=.*|$kv|" "$tmp"
+    for kv in "$@"; do # values are validated: no | or & in them
+        if grep -q "^${kv%%=*}=" "$tmp"; then
+            sed -i "s|^${kv%%=*}=.*|$kv|" "$tmp"
+        else
+            printf '%s\n' "$kv" >>"$tmp" # e.g. an optional setting still commented out
+        fi
     done
     put "$tmp" "$dest" 0644
     rm -f "$tmp"
+}
+
+ipv4_ok() {
+    [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[@]:1}"; do
+        ((10#$o <= 255)) || return 1
+    done
+}
+
+# One relay setting from the command line; returns 1 if <opt> is not one.
+parse_setting() { # parse_setting <opt> <value>
+    local v=$2
+    case $1 in
+    --bind)
+        if [[ $v == auto ]]; then
+            v=$("$TAILSCALE" ip -4 2>/dev/null | head -n 1 || true)
+            [[ -n $v ]] || die "--bind auto: this Pi has no Tailscale address (install Tailscale, then: sudo tailscale up)"
+        fi
+        ipv4_ok "$v" || die "--bind: not an IPv4 address: $v"
+        CONF_KV+=("HIDWAY_BIND=$v")
+        ;;
+    --allow)
+        ipv4_ok "$v" || die "--allow: not an IPv4 address: $v"
+        CONF_KV+=("HIDWAY_ALLOW=$v")
+        ;;
+    --serial)
+        [[ $v =~ ^/dev/[A-Za-z0-9/._-]+$ ]] || die "--serial: not a device path: $v"
+        CONF_KV+=("HIDWAY_SERIAL=$v")
+        ;;
+    --uart)
+        [[ $v == gpio || $v == usb ]] || die "--uart: gpio or usb, not: $v"
+        UART=$v
+        ;;
+    --wake-mac)
+        [[ $v =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] || die "--wake-mac: not a MAC address: $v"
+        CONF_KV+=("HIDWAY_WAKE_MAC=$v")
+        ;;
+    --wake-to)
+        local host=${v%%:*} port=9
+        [[ $v == *:* ]] && port=${v#*:}
+        if ! ipv4_ok "$host" || ! [[ $port =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+            die "--wake-to: not IPv4[:PORT]: $v"
+        fi
+        CONF_KV+=("HIDWAY_WAKE_TO=$v")
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+# Pi 4: UART3 on GPIO4 (TX) / GPIO5 (RX) for a direct wire to the Pico, now
+# and after reboots. Leaves the console UART and Bluetooth alone.
+check_gpio_uart() {
+    local model
+    model=$(tr -d '\0' <"$MODEL_FILE" 2>/dev/null || true)
+    [[ $model == *"Raspberry Pi 4"* || $model == *"Raspberry Pi 400"* || $model == *"Compute Module 4"* ]] ||
+        die "--uart gpio needs a Raspberry Pi 4 (this is: ${model:-unknown}); use a USB adapter (--uart usb)"
+}
+
+enable_gpio_uart() {
+    local cfg
+    cfg=$ROOT/boot/firmware/config.txt
+    [[ -e $cfg ]] || cfg=$ROOT/boot/config.txt
+    [[ -e $cfg ]] || die "cannot find config.txt"
+    if ! grep -qE '^dtoverlay=uart3([[:space:],]|$)' "$cfg"; then
+        backup "$cfg"
+        printf '\n# HIDway: Pico serial link on UART3 (GPIO4 TX, GPIO5 RX)\ndtoverlay=uart3\n' >>"$cfg"
+        say "enabled UART3 in ${cfg#"$ROOT"} (kept after reboots)"
+    fi
+    if [[ -z $ROOT ]] && ! dtoverlay -l 2>/dev/null | grep -q uart3; then
+        dtoverlay uart3 && say "UART3 active now (no reboot needed)"
+        "$UDEVADM" trigger --subsystem-match=tty
+    fi
+}
+
+# --configure: change the settings of an existing installation.
+configure() {
+    [[ -e $ETC/hidwayd.conf ]] || die "not installed yet: run install.sh without --configure first"
+    ((${#CONF_KV[@]})) || [[ -n $UART ]] || die "nothing to change (see --help)"
+    put_conf "$ETC/hidwayd.conf" "$ETC/hidwayd.conf" ${CONF_KV[@]+"${CONF_KV[@]}"}
+    if [[ $UART == gpio ]]; then
+        enable_gpio_uart
+    fi
+    if configured; then
+        "$SYSTEMCTL" enable hidwayd.service
+        "$SYSTEMCTL" restart hidwayd.service
+        say "hidwayd restarted with the new settings"
+    else
+        say "settings saved; still to set: $(grep -v '^[[:space:]]*#' "$ETC/hidwayd.conf" | grep '<' | cut -d= -f1 | tr '\n' ' ')"
+    fi
+    prune_backups
 }
 
 # Service files: units, udev rule and the updater itself.
@@ -177,8 +287,11 @@ full_install() {
     fi
     local overrides=("HIDWAY_REPO=$REPO")
     [[ $REF_SET == 1 ]] && overrides+=("HIDWAY_REF=$REF")
-    put_conf "$here/hidwayd.conf.example" "$ETC/hidwayd.conf"
+    put_conf "$here/hidwayd.conf.example" "$ETC/hidwayd.conf" ${CONF_KV[@]+"${CONF_KV[@]}"}
     put_conf "$here/update.conf.example" "$ETC/update.conf" "${overrides[@]}"
+    if [[ $UART == gpio ]]; then
+        enable_gpio_uart
+    fi
 
     # Build the first release and install the service files of that same
     # commit, both through the updater, so everything comes from one source.
@@ -217,18 +330,31 @@ main() {
         return
         ;;
     -h | --help)
-        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
         return
         ;;
     esac
+    local mode=install
     while (($#)); do
         case $1 in
+        --configure) mode=configure; shift ;;
         --ref) REF=${2:?--ref needs a value}; REF_SET=1; shift 2 ;;
         --repo) REPO=${2:?--repo needs a value}; REPO_SET=1; shift 2 ;;
-        *) die "unknown option: $1 (see --help)" ;;
+        *)
+            (($# >= 2)) || die "$1 needs a value (see --help)"
+            parse_setting "$1" "$2" || die "unknown option: $1 (see --help)"
+            shift 2
+            ;;
         esac
     done
-    full_install
+    if [[ $UART == gpio ]]; then
+        check_gpio_uart # before anything changes
+    fi
+    if [[ $mode == configure ]]; then
+        configure
+    else
+        full_install
+    fi
 }
 
 main "$@"
