@@ -250,9 +250,12 @@ Proposed order; numbers are given when work starts. Rule (user, 2026-10-25):
 nothing ships as an installer before hardening and serious testing.
 
 1. **Security hardening**
-   - Pi: SSH key-only (`PasswordAuthentication yes` today), no root login
-     (`without-password` today), automatic security updates (not installed;
-     1 update pending) — checked 2026-10-25.
+   - Pi: SSH key-only and no root login — done 2026-10-25 (drop-in
+     `00-hardening.conf`; verified: password login refused, key login works).
+     Automatic security updates — done 2026-10-25 (`unattended-upgrades`,
+     security only, no automatic reboot; all updates applied). New kernel
+     installed: needs one reboot, which also proves the GPIO UART comes up
+     from `config.txt` on its own (so far only loaded at runtime).
    - Tailscale ACL: only the player PC may reach the Pi's UDP 47800 (and SSH),
      and the target PC's Sunshine ports.
    - Decide: end-to-end encryption on by default?
