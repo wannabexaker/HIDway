@@ -1,6 +1,7 @@
 # HIDway checklist
 
 Status of each task. Nothing is deleted; completed items keep their evidence.
+Last updated 2026-10-25.
 `[x]` done · `[~]` partial · `[ ]` todo · `[!]` blocked on hardware/decision.
 
 ## Done
@@ -10,7 +11,7 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   scan-code→HID map, wire protocol. Host unit tests pass (ctest).
 - [x] **3. Phase-0 firmware (T0)** — Pico (W) composite HID (boot keyboard +
   16-bit mouse, 1 kHz), honest identity, watchdog, status LED. Builds to
-  `hidway_fw.uf2`. *Not yet run on hardware.*
+  `hidway_fw.uf2`. *Ran on hardware 2026-10-24: see 7.*
 - [x] **4. Client preview UI** — Win32 arm/disarm window, Raw Input capture,
   live display. Does not block local input.
 - [x] **5. Step 1 — UDP transport over Tailscale** — client sender + `hidwayd`
@@ -21,7 +22,7 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
 - [x] **10/11. Serial link code, both ends** — `common/` COBS+CRC16 framing
   (host unit-tested); `hidwayd` serial output + release-on-timeout (`--serial`,
   builds on the Pi); Pico `link.c` UART receiver with catch-up and
-  link-timeout release (firmware builds). *Not yet tested on real hardware.*
+  link-timeout release (firmware builds). *Tested on hardware 2026-10-24: see 8b.*
 - [x] **12. Client UI** — health header (RTT/loss/pps/relay-serial/armed-since),
   recent-input history (memory only), in-app settings + save to hidway.ini,
   panic hotkey + auto-disarm-on-link-loss, always starts disarmed.
@@ -65,7 +66,7 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   0 warnings); end-to-end against the Linux relay in a container: correct key
   40/40 replies, plaintext and wrong key rejected, replay of an identical
   packet rejected, key-less relay still serves plaintext clients.
-  *Not yet on the Pi.*
+  *On the Pi since v0.2.0; not switched on (no key configured).*
 - [x] **7. T0 on-device test — GO** (2026-10-24) — T0 firmware built for a
   Pico 2 (RP2350, `-DPICO_BOARD=pico2`) enumerated on Windows as "HID Keyboard
   Device" + "HID-compliant mouse" with no driver install; holding BOOTSEL typed
@@ -83,11 +84,14 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   -> ttyAMA3` connected (2026-10-24). Link firmware built for the Pico 2.
   `dtoverlay=uart3` added to `config.txt` (takes over at the next boot; boot
   config backed up first).
-- [!] **9. Lower latency (direct path)** — decide from the Nova router whether
+- [x] ~~**9. Lower latency (direct path)**~~ — SKIPPED 2026-10-25: resolved
+  by item 22 (direct Tailscale path without any router change). Original: decide from the Nova router whether
   the line is public (→ one UDP port-forward to the Pi gives a direct Tailscale
   path, ~15–35 ms) or CGNAT (→ stay on relay / other options). Needs: Nova WAN
   IP check.
-- [!] **18. Low-latency path via Cloudflare Zero Trust (option 4)** — WARP
+- [x] ~~**18. Low-latency path via Cloudflare Zero Trust (option 4)**~~ —
+  SKIPPED 2026-10-25: dropped for now; the direct Tailscale path (item 22,
+  p50 37 ms from mobile data) makes it unnecessary. Original: WARP
   client on the remote PC (split tunnel: the relay only) → Cloudflare Tunnel
   (`cloudflared` on the Pi) → `hidwayd` with E2E encryption on (item 17), so
   Cloudflare sees only ciphertext. Needs: Zero Trust onboarding in the
@@ -141,8 +145,8 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   a network ever forces DERP is a Tailscale Peer Relay on the Pi. Moonlight
   reaches the target by its tailnet address; on mobile data the stream needs
   ~10 Mbps (20 Mbps congested the link and the control channel timed out).
-  The target PC's Tailscale uses a fixed UDP port and the user starts it
-  manually (not unattended). SSH to the target PC: key-only, LAN + tailnet
+  The target PC's Tailscale uses a fixed UDP port (later switched to "run
+  unattended" so it is up after Wake-on-LAN, item 25). SSH to the target PC: key-only, LAN + tailnet
   only (laptop alias `gamingpc`). Original analysis, measured 2026-10-25:
   home has a public dynamic IPv4 (no CGNAT), endpoint-independent NAT, no
   UPnP/NAT-PMP, no IPv6; the Pi sits behind the ISP router only, the target
@@ -223,6 +227,61 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,
   security review.
+
+## Next — before installers (MSI / Setup.exe), signing, Linux, macOS
+
+Proposed order; numbers are given when work starts. Rule (user, 2026-10-25):
+nothing ships as an installer before hardening and serious testing.
+
+1. **Security hardening**
+   - Pi: SSH key-only (`PasswordAuthentication yes` today), no root login
+     (`without-password` today), automatic security updates (not installed;
+     1 update pending) — checked 2026-10-25.
+   - Tailscale ACL: only the player PC may reach the Pi's UDP 47800 (and SSH),
+     and the target PC's Sunshine ports.
+   - Relay: reject packets older than the relay's start, so a restart cannot
+     reopen the 2-minute replay window (from item 26).
+   - Decide: end-to-end encryption on by default?
+2. **Device correctness**
+   - Firmware: `HIDWAY_T0` defaults to ON in `firmware/CMakeLists.txt`, so a
+     plain build is the test mode; default to OFF.
+   - Honest USB identity: VID 0xCAFE is a development placeholder; request a
+     PID under the Raspberry Pi VID 0x2E8A (raspberrypi/usb-pid).
+   - Completeness (item 14), at least NKRO and host Caps/Num Lock feedback.
+3. **Serious testing** (item 15) — fail-safe with a key held (kill the client,
+   cut the network, stop the relay, unplug the UART, reboot the Pi, reset the
+   Pico, Tailscale down: all released within 250 ms); packet loss and jitter;
+   login screen / UAC / Ctrl+Alt+Del; BIOS; measured latency (bench mode, not
+   written yet) and a latency report; 8-hour soak; clear errors for a bad
+   `hidway.ini` / `hidwayd.conf`.
+4. **Professional image**
+   - Versions: the exe says 0.1.0.0 (`client/app.rc`) and the client shows
+     no version; take it from the release tag everywhere.
+   - README screenshot is from 2026-10-06 (before the badge and the PC tile).
+   - Docs: ARCHITECTURE still describes the Debug Probe link, ROADMAP is
+     stale, no CHANGELOG.
+   - Code: `client/src/main.c` is 2,700 lines; split into modules (also the
+     base for Linux/macOS clients).
+   - Hardware: soldered board in an enclosure with the 1 kΩ resistors, photos.
+   - Final `/security-review`, `/code-review`, `/repo-hygiene`.
+5. **Setup wizard in the client** (rest of item 24).
+6. Then: MSI (WiX) + `HIDway-Setup.exe` (Inno Setup) → code signing (SignPath
+   Foundation, free for open source) → Linux client → macOS client.
+
+## Waiting on the user
+
+- Press WAKE in the client with the target PC shut down (item 28).
+- Pi SSH / updates and the Tailscale ACL are system settings: the user
+  applies them (commands provided).
+- USB PID request is filed from the owner's GitHub account (text prepared).
+- Permanent hardware build.
+
+## Log
+
+- 2026-10-25 — reconciled against git and the live Pi: items 3, 10/11 and 17
+  no longer "not on hardware / not on the Pi"; 9 and 18 SKIPPED (resolved by
+  22); 22 notes "run unattended". Added Next (hardening and testing before
+  installers) and Waiting.
 
 ## Hardware
 
