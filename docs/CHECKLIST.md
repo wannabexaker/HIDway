@@ -239,6 +239,14 @@ Last updated 2026-10-25.
   client and probe (were fixed at 0.1.0), next to the title in the client,
   `hidway-probe --version`, firmware binary info (`picotool info`). Verified
   with MSVC (warnings as errors), a client screenshot and `picotool info`.
+- [x] **32. Relay fail-safe tests, automated** — DONE 2026-10-26 · `8c08ad4`.
+  `make -C relay failsafe`: the real `hidwayd` with a fake client and a fake
+  Pico (pty); 16 checks: RELEASE on a new serial connection, on client loss
+  (251 ms for a 250 ms timeout), on explicit release, after the serial line
+  returns, on relay stop; stale packets and other senders ignored. In CI on
+  every push. Stable over repeated runs; five deliberate breaks of the relay
+  each caught by the matching check. Hardware part (Pico timeout, USB
+  unplug, real network) still to do with the user.
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,
@@ -268,7 +276,8 @@ nothing ships as an installer before hardening and serious testing.
    - Honest USB identity: VID 0xCAFE is a development placeholder; request a
      PID under the Raspberry Pi VID 0x2E8A (raspberrypi/usb-pid).
    - Completeness (item 14), at least NKRO and host Caps/Num Lock feedback.
-3. **Serious testing** (item 15) — fail-safe with a key held (kill the client,
+3. **Serious testing** (item 15) — relay part automated (item 32); on the
+   hardware, with the user: fail-safe with a key held (kill the client,
    cut the network, stop the relay, unplug the UART, reboot the Pi, reset the
    Pico, Tailscale down: all released within 250 ms); packet loss and jitter;
    login screen / UAC / Ctrl+Alt+Del; BIOS; measured latency (bench mode, not
