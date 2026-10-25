@@ -312,6 +312,15 @@ nothing ships as an installer before hardening and serious testing.
 - 2026-10-25 — 28 DONE (user: WAKE switched the shut-down PC on). 29, 30, 31
   DONE (`639d652`). Pi SSH key-only and automatic updates: commands given to
   the user.
+- 2026-10-26 — Pi hardened and rebooted (kernel 6.18.50, UART up from
+  config.txt). 32 DONE (`8c08ad4`). Hardware fail-safe session started (a
+  test sender held F24 through the relay) but the key recorder did not start
+  on the target; postponed by the user in favour of a day of real use.
+  Readiness checked for that: target services (Tailscale unattended,
+  Sunshine, sshd) automatic and running, no sleep or hibernate, no reboot
+  pending, Wake-on-LAN on; direct Tailscale paths to the Pi and the target;
+  relay v0.3.0 OK, probe 10/10. The Pi stays on v0.3.0 until after that day;
+  29-32 go into the next release then.
 
 ## Hardware
 
