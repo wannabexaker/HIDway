@@ -253,9 +253,10 @@ nothing ships as an installer before hardening and serious testing.
    - Pi: SSH key-only and no root login — done 2026-10-25 (drop-in
      `00-hardening.conf`; verified: password login refused, key login works).
      Automatic security updates — done 2026-10-25 (`unattended-upgrades`,
-     security only, no automatic reboot; all updates applied). New kernel
-     installed: needs one reboot, which also proves the GPIO UART comes up
-     from `config.txt` on its own (so far only loaded at runtime).
+     security only, no automatic reboot; all updates applied). Rebooted for
+     the new kernel (6.18.50): the GPIO UART came up from `config.txt` on its
+     own (first proof; so far it was loaded at runtime), no failed units,
+     `hidway-status` OK with the target on, laptop probe 10/10 (p50 4.3 ms).
    - Tailscale ACL: only the player PC may reach the Pi's UDP 47800 (and SSH),
      and the target PC's Sunshine ports.
    - Decide: end-to-end encryption on by default?
