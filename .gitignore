@@ -43,3 +43,6 @@ secrets/
 # OS
 Thumbs.db
 .DS_Store
+
+# Local working files (plans, drafts, test output)
+.scratch/

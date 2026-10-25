@@ -257,8 +257,12 @@ nothing ships as an installer before hardening and serious testing.
      the new kernel (6.18.50): the GPIO UART came up from `config.txt` on its
      own (first proof; so far it was loaded at runtime), no failed units,
      `hidway-status` OK with the target on, laptop probe 10/10 (p50 4.3 ms).
-   - Tailscale ACL: only the player PC may reach the Pi's UDP 47800 (and SSH),
-     and the target PC's Sunshine ports.
+   - Tailscale ACL — not now (user decision 2026-10-26): one user, own
+     devices only; the relay already accepts the player PC alone (Tailscale
+     authenticates source addresses) and SSH is key-only on the Pi and the
+     target, so the rules would mostly restrict the phone, at the cost of
+     editing them for every new device or tool. Needed as soon as other
+     people's devices join the tailnet; a draft is kept locally.
    - Decide: end-to-end encryption on by default?
 2. **Device correctness**
    - Honest USB identity: VID 0xCAFE is a development placeholder; request a
