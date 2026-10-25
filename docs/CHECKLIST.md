@@ -195,7 +195,10 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   history notes target changes; `hidway-probe` prints the target. Tests:
   unit (frame round trip, corrupt/out-of-range, WAKE decode), Linux
   end-to-end with a pty Pico (reports, staleness, wake burst, rate limit),
-  shellcheck, previews. Remaining: flash the Pico 2, release, verify live.
+  shellcheck, previews. Released as v0.2.2 and deployed; Pico 2 flashed.
+  Verified live: the relay and the client show the target "on" (after
+  fixing the Pico TX -> Pi RX wire). Remaining: press WAKE in the client with
+  the target shut down (the same packet as `hidway-wake`, already verified).
 - [x] **27. Updater: no false "service files changed"** (2026-10-25) — only
   the files `--apply-system` installs count, not examples or docs;
   `.gitattributes` keeps the Linux scripts LF in Windows checkouts.
