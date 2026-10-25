@@ -88,6 +88,24 @@ over USB and wired to the Raspberry Pi's GPIO UART (two data lines through
 series resistors, plus ground), with the four status LEDs described under
 [Pico firmware](#pico-firmware). Wiring: [docs/RELAY.md](docs/RELAY.md#serial-link-to-the-pico).
 
+## Install (Windows)
+
+Unpack a HIDway release and run `Setup.cmd`. It asks which PC this is and
+shows a checklist of what to install there:
+
+| Part | Where | Installed with |
+|------|-------|----------------|
+| HIDway client | the PC you play from | copied from the release |
+| [Tailscale](https://tailscale.com/) | every PC | winget `Tailscale.Tailscale` |
+| [Moonlight](https://moonlight-stream.org/) | the PC you play from | winget `MoonlightGameStreamingProject.Moonlight` |
+| [Sunshine](https://github.com/LizardByte/Sunshine) | the gaming PC | winget `LizardByte.Sunshine` |
+
+Each part keeps its own official installer and updates on its own
+(`Setup.cmd -Update`); nothing third-party is bundled. `Setup.cmd -WhatIf`
+shows what would happen. Without winget, the official download pages open
+instead. The Raspberry Pi side is installed with `relay/deploy/install.sh`
+(see [Relay](#relay-hidwayd-on-the-raspberry-pi)).
+
 ## Build
 
 ### Host unit tests (any platform with a C compiler + CMake)

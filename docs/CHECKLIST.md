@@ -165,12 +165,20 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   photos: no vulnerability at confidence >= 8. Defense-in-depth idea for
   later: persist the relay's replay timestamp (or reject packets older than
   the relay's start) so a restart cannot reopen a 2-minute replay window.
-- [ ] **24. Guided setup for new users** — Windows installer for the client,
+- [~] **24. Guided setup for new users** — Windows installer for the client,
   then a setup wizard: (1) install on this PC, (2) find the Raspberry Pi on the
   network and install the relay over SSH, filling in the addresses, (3) "plug
   the Pico in holding BOOTSEL" and flash the right firmware for the detected
   board (Pico / Pico 2, W or not), (4) end-to-end check. Publish prebuilt
   client and firmware files with each release.
+  Done (2026-10-25): `install.sh` takes every setting on the command line
+  (`--bind auto --allow --uart gpio --wake-mac --wake-to`, `--configure`),
+  41 fake-root tests; `tools/setup/Setup.cmd`: per-PC checklist of HIDway,
+  Tailscale, Moonlight, Sunshine, each with its own official installer
+  (winget), `-Update`, `-WhatIf`, recommended Moonlight settings, optional
+  Sunshine input off. Verified: dry runs on both PCs, a real install in a
+  clean Windows Sandbox (no winget: official pages offered, client starts).
+  Next: release assets built by CI, then the wizard in the client.
 - [x] **25. Wake-on-LAN** (2026-10-25) — `hidwayd --wake MAC [--wake-to
   IPv4[:PORT]]` (magic packet, SO_BROADCAST, sent 3 times; MAC/address
   validated) and `hidway-wake`, which reads `HIDWAY_WAKE_MAC` /
