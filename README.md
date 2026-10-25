@@ -1,5 +1,7 @@
 # HIDway
 
+[![CI](https://github.com/wannabexaker/HIDway/actions/workflows/ci.yml/badge.svg)](https://github.com/wannabexaker/HIDway/actions/workflows/ci.yml)
+
 **Remote physical keyboard & mouse over a real USB HID interface.**
 
 HIDway lets you control a computer from another PC across the network, where

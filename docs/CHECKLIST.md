@@ -178,7 +178,13 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   (winget), `-Update`, `-WhatIf`, recommended Moonlight settings, optional
   Sunshine input off. Verified: dry runs on both PCs, a real install in a
   clean Windows Sandbox (no winget: official pages offered, client starts).
-  Next: release assets built by CI, then the wizard in the client.
+  CI (2026-10-25): `.github/workflows/ci.yml` builds and tests everything on
+  each push (gcc + MSVC with warnings as errors, relay `make check`,
+  install.sh tests, shellcheck, firmware for Pico / Pico W / Pico 2 / Pico 2 W,
+  release files); first run on GitHub all green, no annotations.
+  `release.yml` publishes the Windows zip, the .uf2 files and SHA256SUMS.txt
+  for an annotated `vX.Y.Z` tag on main (first real run with the next tag).
+  Next: the setup wizard in the client.
 - [x] **25. Wake-on-LAN** (2026-10-25) — `hidwayd --wake MAC [--wake-to
   IPv4[:PORT]]` (magic packet, SO_BROADCAST, sent 3 times; MAC/address
   validated) and `hidway-wake`, which reads `HIDWAY_WAKE_MAC` /
