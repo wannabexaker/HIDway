@@ -11,6 +11,7 @@
  *   hidway-probe HOST [PORT] [--key HEX | --key-file FILE] [-n COUNT] [-i MS]
  *   hidway-probe ... --test-replay           send one sealed probe twice; a
  *                                            correct relay answers exactly once
+ *   hidway-probe --version
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,6 +23,7 @@
 
 #include "config.h"
 #include "hidway_crypto.h"
+#include "hidway_version.h"
 #include "net.h"
 #include "protocol.h"
 
@@ -35,7 +37,8 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: hidway-probe --ini hidway.ini [-n COUNT] [-i MS]\n"
-            "       hidway-probe HOST [PORT] [--key HEX | --key-file FILE] [-n COUNT] [-i MS]\n");
+            "       hidway-probe HOST [PORT] [--key HEX | --key-file FILE] [-n COUNT] [-i MS]\n"
+            "       hidway-probe --version\n");
 }
 
 static int read_key_file(const char *path, char *hex, size_t cap)
@@ -64,6 +67,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-n") && i + 1 < argc) count = atoi(argv[++i]);
         else if (!strcmp(a, "-i") && i + 1 < argc) interval_ms = atoi(argv[++i]);
         else if (!strcmp(a, "--test-replay")) test_replay = 1;
+        else if (!strcmp(a, "--version") || !strcmp(a, "-V")) { printf("hidway-probe %s\n", HIDWAY_VERSION); return 0; }
         else if (a[0] == '-') { usage(); return 2; }
         else if (!host) host = a;
         else port = atoi(a);

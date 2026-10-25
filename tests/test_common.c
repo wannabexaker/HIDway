@@ -581,6 +581,12 @@ static void test_replay_guard(void)
     hidway_replay_t fresh = {0};
     CHECK(!hidway_replay_accept(&fresh, now - win - 1, now, win)); /* stale after restart */
     CHECK(hidway_replay_accept(&fresh, now - win + 1, now, win));
+    /* the relay starts with its start time as the floor: a packet captured
+     * shortly before a restart is refused although it is inside the window */
+    hidway_replay_t started = {.last_ts_us = now};
+    CHECK(!hidway_replay_accept(&started, now - 5000000ull, now + 1000, win));
+    CHECK(!hidway_replay_accept(&started, now, now + 1000, win));
+    CHECK(hidway_replay_accept(&started, now + 500, now + 1000, win));
 }
 
 static void test_key_text(void)

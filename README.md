@@ -160,14 +160,15 @@ GNU toolchain.
 
 ```bash
 cmake -S firmware -B build/firmware -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DPICO_BOARD=pico2 -DHIDWAY_T0=OFF
+      -DPICO_BOARD=pico2
 cmake --build build/firmware
 # flash build/firmware/hidway_fw.uf2 via BOOTSEL
 ```
 
-`PICO_BOARD` is `pico`, `pico_w`, `pico2` or `pico2_w`. `HIDWAY_T0=ON` (the
-default) builds a stand-alone test mode instead of the relay link: holding
-BOOTSEL holds W and moves the mouse, to check that a target accepts the device.
+`PICO_BOARD` is `pico`, `pico_w`, `pico2` or `pico2_w`. Each release also
+ships the firmware for all four boards. `-DHIDWAY_T0=ON` builds a stand-alone
+test mode instead of the relay link: holding BOOTSEL holds W and moves the
+mouse, to check that a target accepts the device.
 On Windows, `tools/build.ps1` builds both the firmware and the host tests.
 
 Optional status LEDs, each through a series resistor (330 Ω; 100 Ω for blue):

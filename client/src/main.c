@@ -41,6 +41,7 @@
 #include "config.h"
 #include "hidway_crypto.h"
 #include "hidway_kbd.h"
+#include "hidway_version.h"
 #include "keymap_sc2hid.h"
 #include "net.h"
 #include "protocol.h"
@@ -293,6 +294,14 @@ static int font_h(HDC dc, HFONT f)
     SelectObject(dc, f);
     GetTextMetricsW(dc, &tm);
     return tm.tmHeight;
+}
+
+static int font_ascent(HDC dc, HFONT f)
+{
+    TEXTMETRICW tm;
+    SelectObject(dc, f);
+    GetTextMetricsW(dc, &tm);
+    return tm.tmAscent;
 }
 
 /* Draw text vertically centred on the line y = cy. */
@@ -1651,6 +1660,9 @@ static void paint_header(HDC dc)
         DrawIconEx(dc, L->mark.left, L->mark.top, g.mark_icon, L->mark.right - L->mark.left,
                    L->mark.bottom - L->mark.top, 0, NULL, DI_NORMAL);
     text_at(dc, g.f_title, C_TEXT, L->title_x, L->title_y, "HIDway");
+    /* the version on the title's baseline */
+    text_at(dc, g.f_label, C_TEXT3, L->title_x + text_w(dc, g.f_title, "HIDway") + S(8),
+            L->title_y + font_ascent(dc, g.f_title) - font_ascent(dc, g.f_label), HIDWAY_VERSION);
     text_at(dc, g.f_sub, C_TEXT3, L->title_x, L->sub_y, "Remote keyboard & mouse over real USB HID");
 
     RECT p = L->pill;

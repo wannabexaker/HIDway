@@ -3,13 +3,15 @@
 #   powershell -ExecutionPolicy Bypass -File tools\build.ps1            # firmware + tests
 #   powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Target firmware
 #   powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Target tests
+#   powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Target firmware -T0   # test mode
 #
 # Needs: Visual Studio (C++ workload, provides cl, CMake and Ninja), the Pico
 # SDK under ~/.pico-sdk/sdk/<ver> (or PICO_SDK_PATH) and the Arm GNU toolchain
 # under ~/.pico-sdk/toolchain/<ver> (or PICO_TOOLCHAIN_PATH).
 param(
     [ValidateSet('all', 'firmware', 'tests')]
-    [string]$Target = 'all'
+    [string]$Target = 'all',
+    [switch]$T0  # Phase-0 test mode instead of the relay link (always set, never cached)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,8 +35,9 @@ function Invoke-InVsEnv([string]$commands) {
 
 if ($Target -in 'all', 'firmware') {
     if (-not $env:PICO_TOOLCHAIN_PATH) { throw 'Arm GNU toolchain not found; set PICO_TOOLCHAIN_PATH' }
-    Invoke-InVsEnv 'cmake -S firmware -B build\firmware -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build\firmware'
-    Write-Host "firmware: $root\build\firmware\hidway_fw.uf2"
+    $mode = if ($T0) { 'ON' } else { 'OFF' }
+    Invoke-InVsEnv "cmake -S firmware -B build\firmware -G Ninja -DCMAKE_BUILD_TYPE=Release -DHIDWAY_T0=$mode && cmake --build build\firmware"
+    Write-Host "firmware ($(if ($T0) { 'T0 test mode' } else { 'relay link' })): $root\build\firmware\hidway_fw.uf2"
 }
 
 if ($Target -in 'all', 'tests') {

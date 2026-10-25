@@ -62,7 +62,8 @@
 #define WAKE_MIN_GAP_MS   3000  /* at most one Wake-on-LAN burst per this, on request */
 
 /* Sealed packets must be within this of the relay's wall clock (both ends run
- * NTP); together with "strictly newer" it bounds replays after a restart. */
+ * NTP) and newer than the relay's start, so a restart cannot reopen a window
+ * for packets captured before it. */
 #define REPLAY_WINDOW_US (120ull * 1000000ull)
 
 static volatile sig_atomic_t running = 1;
@@ -91,6 +92,8 @@ static struct {
     bool warned_plain;  /* plaintext seen while encryption is required */
     bool warned_sealed; /* sealed seen while no key is configured */
     bool warned_skew;
+    bool warned_old;    /* sealed before this start */
+    uint64_t start_us;  /* wall clock at start: nothing older is accepted */
     uint32_t rejected;  /* forged, tampered, replayed or wrong-mode packets */
 } cry;
 
@@ -310,6 +313,10 @@ static bool relay_decode(const uint8_t *buf, size_t n, hidway_input_pkt_t *p)
             fprintf(stderr, "hidwayd: rejecting packets: client clock is %+lld s off "
                             "(sync both clocks with NTP)\n", skew_s);
             cry.warned_skew = true;
+        } else if (!cry.warned_old && ts <= cry.start_us) {
+            fprintf(stderr, "hidwayd: rejected a packet sealed before this relay started "
+                            "(a replay, or the client clock is behind this one)\n");
+            cry.warned_old = true;
         }
         hidway_wipe(inner, sizeof inner);
         return false;
@@ -694,6 +701,8 @@ int main(int argc, char **argv)
         if (!load_key_file(key_path))
             return 2; /* never fall back to plaintext when a key was asked for */
         cry.on = true;
+        cry.start_us = wall_us();
+        cry.replay.last_ts_us = cry.start_us;
     }
 
     signal(SIGINT, on_signal);

@@ -13,7 +13,8 @@ limits that to a single authenticated peer:
   client and the relay, every packet is sealed with XChaCha20‑Poly1305
   (Monocypher, vendored unmodified and checked against the IETF test vector).
   Packets carry a timestamp; the relay accepts only strictly newer timestamps
-  within ±2 minutes of its clock, so captured traffic cannot be replayed. This
+  within ±2 minutes of its clock and never one older than its own start, so
+  captured traffic cannot be replayed, not even after a relay restart. This
   keeps keystrokes confidential and unforgeable even on paths that terminate
   encryption in the middle (e.g. a Zero Trust proxy). With a key configured,
   plaintext is refused and neither end ever falls back to it.

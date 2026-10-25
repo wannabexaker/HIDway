@@ -1,0 +1,6 @@
+#include <windows.h>
+#include "hidway_version.h"
+
+#define HIDWAY_RC_DESCRIPTION "HIDway probe (relay reachability and RTT)"
+#define HIDWAY_RC_FILENAME "hidway-probe.exe"
+#include "versioninfo.rc"

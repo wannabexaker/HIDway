@@ -166,8 +166,9 @@ Tailscale already encrypts the path end to end. If the traffic takes a path
 that terminates encryption in the middle (for example Cloudflare WARP +
 Tunnel), turn on HIDway's own encryption so that path only ever sees
 ciphertext: every packet is sealed with XChaCha20-Poly1305 using a pre-shared
-32-byte key, and replays are rejected by timestamp. Both clocks must be in
-sync (NTP) within two minutes.
+32-byte key, and replays are rejected by timestamp (strictly newer, and never
+older than the relay's start). Both clocks must be in sync (NTP) within two
+minutes.
 
 ```bash
 # on the Pi: create the key (readable by root and the service group only)

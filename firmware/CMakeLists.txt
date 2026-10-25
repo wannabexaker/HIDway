@@ -11,7 +11,7 @@ include(pico_sdk_import.cmake)
 project(hidway_firmware C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 
-option(HIDWAY_T0 "Phase-0 go/no-go test mode: BOOTSEL holds W and moves the mouse" ON)
+option(HIDWAY_T0 "Phase-0 go/no-go test mode instead of the relay link: BOOTSEL holds W and moves the mouse" OFF)
 set(HIDWAY_USB_VID "0xCAFE" CACHE STRING "USB vendor ID (development default)")
 set(HIDWAY_USB_PID "0x4877" CACHE STRING "USB product ID")
 
@@ -63,3 +63,12 @@ pico_enable_stdio_usb(hidway_fw 0)
 pico_enable_stdio_uart(hidway_fw 0)
 
 pico_add_extra_outputs(hidway_fw)
+
+# Version from the release tag (as for the client), shown by `picotool info`;
+# taken when CMake configures.
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/hidway_version.cmake)
+if (NOT HIDWAY_VERSION)
+    hidway_version(HIDWAY_VERSION ${CMAKE_CURRENT_LIST_DIR}/..)
+endif ()
+pico_set_program_version(hidway_fw "${HIDWAY_VERSION}")
+pico_set_program_url(hidway_fw "https://github.com/wannabexaker/HIDway")

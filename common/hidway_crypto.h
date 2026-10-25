@@ -53,7 +53,8 @@ size_t hidway_open(uint8_t *out, size_t cap, const uint8_t key[HIDWAY_KEY_LEN],
 
 /* Replay guard for the receiving side. A timestamp is accepted only if it is
  * strictly newer than every timestamp accepted before and within +/- window
- * of the local wall clock (which bounds replays after a restart). */
+ * of the local wall clock. Start with last_ts_us = the receiver's start time
+ * (wall clock), so nothing sealed before a restart is accepted after it. */
 typedef struct {
     uint64_t last_ts_us;
 } hidway_replay_t;

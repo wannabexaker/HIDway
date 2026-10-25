@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the release firmware (HIDWAY_T0=OFF) for each supported board and
+# Build the release firmware (relay link, HIDWAY_T0=OFF) for each board and
 # copy it to OUT_DIR as hidway_fw_<board>.uf2.
 #
 #   PICO_SDK_PATH=<sdk> tools/ci/build-firmware.sh OUT_DIR [BOARD...]
