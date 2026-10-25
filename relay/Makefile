@@ -1,6 +1,8 @@
 # hidwayd - Raspberry Pi relay. Plain C, no external dependencies.
 #   make            build ./hidwayd (version taken from git)
 #   make check      build and run the common/ unit tests
+#   make failsafe   run the fail-safe tests against the real relay (timing
+#                   based; Linux; not part of `check`, which gates deployment)
 #   make run        build and run (bind 0.0.0.0:47800, verbose, no serial)
 #   make clean
 #
@@ -29,12 +31,20 @@ hidwayd: hidwayd.c $(COMMON) $(HEADERS)
 hidway_tests: $(TEST_SRC) $(HEADERS) ../common/hidway_motion.h ../common/keymap_sc2hid.h
 	$(CC) $(CFLAGS) -I../common -o $@ $(TEST_SRC)
 
-.PHONY: check run clean
+FAILSAFE_SRC = ../tests/relay/failsafe.c ../common/serial.c ../common/cobs.c ../common/crc16.c
+
+failsafe_test: $(FAILSAFE_SRC) $(HEADERS)
+	$(CC) $(CFLAGS) -I../common -o $@ $(FAILSAFE_SRC)
+
+.PHONY: check failsafe run clean
 check: hidway_tests
 	./hidway_tests
+
+failsafe: hidwayd failsafe_test
+	./failsafe_test ./hidwayd
 
 run: hidwayd
 	./hidwayd
 
 clean:
-	rm -f hidwayd hidway_tests
+	rm -f hidwayd hidway_tests failsafe_test

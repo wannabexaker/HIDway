@@ -15,6 +15,7 @@ out/
 *.ilk
 relay/hidwayd
 relay/hidway_tests
+relay/failsafe_test
 
 # IDE / tooling
 .vs/

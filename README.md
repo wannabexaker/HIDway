@@ -203,6 +203,11 @@ make && make check
           --serial /dev/hidway-serial
 ```
 
+`make failsafe` runs the relay against a fake client and a fake Pico (a
+pseudo-terminal) and checks that every way the input can stop (client gone,
+explicit release, serial line pulled, relay stopped) ends in a RELEASE frame
+within its time limit. CI runs it on every push.
+
 ## Status
 
 Early development. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan and
