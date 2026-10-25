@@ -17,6 +17,13 @@ HIDWAY_PORT=47800
 HIDWAY_SERIAL=/dev/hidway-serial
 HIDWAY_BAUD=921600
 
+# Wake-on-LAN for `hidway-wake` (optional): the target PC's MAC address, and
+# where to send the packet: the target's broadcast address on this network
+# (default 255.255.255.255:9), or a router that forwards the UDP port to the
+# target. See docs/RELAY.md, "Wake-on-LAN".
+# HIDWAY_WAKE_MAC=aa:bb:cc:dd:ee:ff
+# HIDWAY_WAKE_TO=<router-ip>:9
+
 # Extra options. Remove --quiet to log a once-per-second summary.
 #
 # End-to-end encryption (optional, recommended on any path that is not

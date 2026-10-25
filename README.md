@@ -168,6 +168,9 @@ sudo relay/deploy/install.sh
 hidway-status
 ```
 
+Optionally, `hidway-wake` switches the target PC on with Wake-on-LAN, also
+from outside through Tailscale (`ssh <pi> hidway-wake`).
+
 See [docs/RELAY.md](docs/RELAY.md). To build and run it by hand instead:
 
 ```bash

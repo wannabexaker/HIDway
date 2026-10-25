@@ -1,0 +1,4 @@
+# Shell scripts and units run on Linux: keep LF even in Windows checkouts.
+*.sh            text eol=lf
+relay/deploy/*  text eol=lf
+relay/Makefile  text eol=lf

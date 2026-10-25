@@ -44,7 +44,7 @@ SERVICE=hidwayd.service
 TIMER=hidway-update.timer
 HEALTH_TIMEOUT=10
 DEPLOY_FILES=(install.sh hidway-update hidwayd.service hidway-update.service
-    hidway-update.timer 99-hidway.rules 60-hidway)
+    hidway-update.timer 99-hidway.rules 60-hidway hidway-wake)
 
 # Defaults; /etc/hidway/update.conf overrides them.
 HIDWAY_REPO= # empty: keep the checkout's origin
@@ -256,7 +256,8 @@ prune() { # prune [extra release dir to keep]
 check_system_files() { # check_system_files <commit>
     local installed
     installed=$(cat "$SYSTEM_COMMIT" 2>/dev/null || true)
-    if ! changed "$installed" "$1" relay/deploy; then
+    # Only the files --apply-system installs count (not examples or docs).
+    if ! changed "$installed" "$1" "${DEPLOY_FILES[@]/#/relay/deploy/}"; then
         rm -f "$SYSTEM_PENDING"
         return 0
     fi

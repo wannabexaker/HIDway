@@ -14,7 +14,8 @@
 #   /etc/hidway/           hidwayd.conf, update.conf
 #   systemd   hidwayd.service, hidway-update.timer (daily release check)
 #   udev      /dev/hidway-serial for the Raspberry Pi Debug Probe
-#   commands  /usr/local/sbin/hidway-update, /usr/local/bin/hidway-status
+#   commands  /usr/local/sbin/hidway-update, /usr/local/bin/hidway-status,
+#             /usr/local/bin/hidway-wake
 #   login     one status line (/etc/update-motd.d/60-hidway)
 #
 # Internal: install.sh --refresh <dir> installs the service files found in
@@ -106,6 +107,7 @@ install_system_files() { # install_system_files <dir>
     put "$d/99-hidway.rules" "$ROOT/etc/udev/rules.d/99-hidway.rules" 0644
     put "$d/hidway-update" "$ROOT/usr/local/sbin/hidway-update" 0755
     put "$d/60-hidway" "$ROOT/etc/update-motd.d/60-hidway" 0755
+    put "$d/hidway-wake" "$ROOT/usr/local/bin/hidway-wake" 0755
     if [[ $(readlink "$ROOT/usr/local/bin/hidway-status" 2>/dev/null) != ../sbin/hidway-update ]]; then
         mkdir -p "$ROOT/usr/local/bin"
         ln -sfn ../sbin/hidway-update "$ROOT/usr/local/bin/hidway-status"

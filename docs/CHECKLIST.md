@@ -171,8 +171,20 @@ Status of each task. Nothing is deleted; completed items keep their evidence.
   the Pico in holding BOOTSEL" and flash the right firmware for the detected
   board (Pico / Pico 2, W or not), (4) end-to-end check. Publish prebuilt
   client and firmware files with each release.
-- [ ] **25. Wake-on-LAN** — wake the target PC from the Pi for remote use
-  while it is off or asleep.
+- [x] **25. Wake-on-LAN** (2026-10-25) — `hidwayd --wake MAC [--wake-to
+  IPv4[:PORT]]` (magic packet, SO_BROADCAST, sent 3 times; MAC/address
+  validated) and `hidway-wake`, which reads `HIDWAY_WAKE_MAC` /
+  `HIDWAY_WAKE_TO` from `hidwayd.conf` without executing it. Target behind a
+  second router: UDP 9 forwarded from the Pi only plus a static ARP entry
+  (docs/RELAY.md). Firmware: power-on by PCI-E allowed, ErP off.
+  Verified: from a full shutdown the PC switched itself on, Tailscale came up
+  unattended, the user logged in through Moonlight. Tests: packet bytes,
+  config parsing, bad input, fake-root install, shellcheck clean.
+  Next: target power state (on/asleep/off) from the Pico over its TX line and
+  a "Wake" button in the client.
+- [x] **27. Updater: no false "service files changed"** (2026-10-25) — only
+  the files `--apply-system` installs count, not examples or docs;
+  `.gitattributes` keeps the Linux scripts LF in Windows checkouts.
 - [ ] **14. Completeness** — NKRO, horizontal wheel, host LED feedback,
   soft-detach / physical arm switch, remote Pico flashing.
 - [ ] **15. Stable 1.0** — soak test, latency report, config validation,

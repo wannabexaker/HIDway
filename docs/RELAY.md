@@ -139,6 +139,7 @@ sudo hidway-update --now          # also during a live session; retries a held r
 sudo hidway-update --check        # is a newer release available? (exit 10 if yes)
 sudo hidway-update --rollback     # back to the previous release, and stay there
 sudo hidway-update --apply-system # install changed service files
+hidway-wake                       # switch the target PC on (Wake-on-LAN)
 journalctl -u hidwayd -u hidway-update -f
 ```
 
@@ -216,6 +217,50 @@ one of them is powered. For another USB-serial adapter, point `HIDWAY_SERIAL`
 at its `/dev/serial/by-id/...` path and give the `hidway` group access to it
 with a similar rule.
 
+### Wake-on-LAN (optional)
+
+`hidway-wake` switches the target PC on with a Wake-on-LAN magic packet, so it
+can be started from anywhere (for example `ssh <pi> hidway-wake` over
+Tailscale). No root is needed.
+
+On the target PC, once:
+
+- **Firmware (BIOS/UEFI):** allow power-on by the network card. ASUS: *Power
+  On By PCI-E* on and *ErP Ready* off; other boards call it *Wake on LAN* or
+  *Resume by PCI-E Device*, with *ErP* / *Deep Sleep* off.
+- **Windows:** in the wired adapter's properties, *Power Management → Allow
+  this device to wake the computer*, and under *Advanced* *Wake on Magic
+  Packet* and *Shutdown Wake-On-Lan* on. With Fast Startup off, waking from a
+  full shutdown is reliable.
+- For use from outside after a full shutdown, run Tailscale on the target PC
+  unattended, so it connects before anyone logs in.
+
+On the Pi, in `/etc/hidway/hidwayd.conf`:
+
+```bash
+HIDWAY_WAKE_MAC=aa:bb:cc:dd:ee:ff   # the target's wired network card
+HIDWAY_WAKE_TO=<router-ip>:9        # only when the target is behind another router
+```
+
+Then run `hidway-wake` (or `hidway-wake <mac> [<ipv4>[:<port>]]`). When the
+target is on the Pi's own network, leave `HIDWAY_WAKE_TO` unset and the packet
+goes to the local broadcast address.
+
+Magic packets do not cross routers. If the target sits behind a second router
+(double NAT), forward UDP port 9 **from the Pi only** to the target there, and
+add a static ARP entry so the packet still reaches it while it is off; then
+set `HIDWAY_WAKE_TO` to that router's address on the Pi's network. MikroTik
+example:
+
+```
+/ip dhcp-server lease make-static [find address=<target-ip>]
+/ip arp add address=<target-ip> mac-address=<target-mac> interface=bridge comment="HIDway: wake-on-LAN"
+/ip firewall nat add chain=dstnat in-interface=<wan-interface> src-address=<pi-ip> protocol=udp dst-port=9 action=dst-nat to-addresses=<target-ip> to-ports=9 comment="HIDway: wake-on-LAN from the Pi"
+```
+
+The magic packet can only switch the PC on; nothing else is reachable through
+the forward.
+
 ## Layout
 
 | Path | Contents |
@@ -233,6 +278,7 @@ with a similar rule.
 | `/etc/update-motd.d/60-hidway` | Status line at login |
 | `/usr/local/sbin/hidway-update` | Update / rollback command |
 | `/usr/local/bin/hidway-status` | Status command (no root needed) |
+| `/usr/local/bin/hidway-wake` | Wake-on-LAN for the target PC (no root needed) |
 | `/run/hidway/state` | Live state published by `hidwayd` |
 | `/var/backups/hidway/<time>/` | Backups of replaced files and configuration (last 10 runs) |
 

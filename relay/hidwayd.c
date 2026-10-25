@@ -25,6 +25,7 @@
  */
 #define _GNU_SOURCE /* cfmakeraw, CRTSCTS, getopt_long, clock_gettime */
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -120,6 +121,77 @@ static int gen_key(void)
     printf("%s\n", hex);
     hidway_wipe(k, sizeof k);
     hidway_wipe(hex, sizeof hex);
+    return 0;
+}
+
+/* ------------------------------------------------------------ wake-on-LAN */
+
+static bool parse_mac(const char *s, uint8_t mac[6])
+{
+    if (strlen(s) != 17)
+        return false;
+    for (int i = 0; i < 6; i++) {
+        const char *p = s + 3 * i;
+        if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1]) ||
+            (i < 5 && p[2] != ':' && p[2] != '-'))
+            return false;
+        char byte[3] = {p[0], p[1], 0};
+        mac[i] = (uint8_t)strtoul(byte, NULL, 16);
+    }
+    return true;
+}
+
+/* One-shot: send a Wake-on-LAN magic packet (6 x 0xFF, then the MAC 16 times)
+ * over UDP to `to` ("IPv4[:PORT]", default the local broadcast on port 9),
+ * three times since UDP may drop one. The address is the target's broadcast
+ * address on this network, or a router that forwards the port to the target. */
+static int wake_target(const char *mac_text, const char *to)
+{
+    uint8_t mac[6];
+    if (!parse_mac(mac_text, mac)) {
+        fprintf(stderr, "hidwayd: bad MAC address: %s (use aa:bb:cc:dd:ee:ff)\n", mac_text);
+        return 2;
+    }
+    char host[64];
+    int port = 9;
+    snprintf(host, sizeof host, "%s", to ? to : "255.255.255.255");
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = 0;
+        port = atoi(colon + 1);
+    }
+    struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    if (port <= 0 || port > 65535 || inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
+        fprintf(stderr, "hidwayd: bad wake address: %s (use IPv4[:PORT])\n", to ? to : host);
+        return 2;
+    }
+
+    uint8_t pkt[6 + 16 * 6];
+    memset(pkt, 0xFF, 6);
+    for (int i = 0; i < 16; i++)
+        memcpy(pkt + 6 + 6 * i, mac, 6);
+
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int on = 1;
+    if (s < 0 || setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof on) != 0) {
+        perror("hidwayd: wake socket");
+        if (s >= 0)
+            close(s);
+        return 1;
+    }
+    int sent = 0;
+    for (int i = 0; i < 3; i++) {
+        if (sendto(s, pkt, sizeof pkt, 0, (const struct sockaddr *)&dst, sizeof dst) == (ssize_t)sizeof pkt)
+            sent++;
+        struct timespec gap = {0, 100 * 1000000L};
+        nanosleep(&gap, NULL);
+    }
+    close(s);
+    if (!sent) {
+        perror("hidwayd: wake sendto");
+        return 1;
+    }
+    printf("hidwayd: magic packet for %s sent to %s:%d\n", mac_text, host, port);
     return 0;
 }
 
@@ -456,8 +528,9 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--bind IP] [--allow IP] [--port N] [--serial DEV] [--baud N]\n"
             "          [--state-file PATH] [--key-file PATH] [--quiet] [--version]\n"
-            "       %s --gen-key   print a new random 32-byte key (64 hex chars)\n",
-            argv0, argv0);
+            "       %s --gen-key   print a new random 32-byte key (64 hex chars)\n"
+            "       %s --wake MAC [--wake-to IPv4[:PORT]]   send a Wake-on-LAN packet\n",
+            argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -466,6 +539,7 @@ int main(int argc, char **argv)
     const char *allow_addr = NULL; /* if set, only accept this source IP */
     const char *state_path = NULL; /* if set, publish link/serial state here */
     const char *key_path = NULL;   /* if set, require sealed packets */
+    const char *wake_mac = NULL, *wake_to = NULL; /* --wake: send a magic packet and exit */
     int port = 47800;
     int quiet = 0;
     serial_link_t ser = {.baud = 921600, .fd = -1};
@@ -479,12 +553,14 @@ int main(int argc, char **argv)
         {"state-file", required_argument, 0, 'S'},
         {"key-file", required_argument, 0, 'k'},
         {"gen-key", no_argument, 0, 'G'},
+        {"wake", required_argument, 0, 'W'},
+        {"wake-to", required_argument, 0, 'T'},
         {"quiet", no_argument, 0, 'q'},
         {"version", no_argument, 0, 'V'},
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "b:a:p:s:B:S:k:GqV", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "b:a:p:s:B:S:k:GW:T:qV", opts, NULL)) != -1) {
         switch (c) {
         case 'b': bind_addr = optarg; break;
         case 'a': allow_addr = optarg; break;
@@ -494,11 +570,15 @@ int main(int argc, char **argv)
         case 'S': state_path = optarg; break;
         case 'k': key_path = optarg; break;
         case 'G': return gen_key();
+        case 'W': wake_mac = optarg; break;
+        case 'T': wake_to = optarg; break;
         case 'q': quiet = 1; break;
         case 'V': printf("hidwayd %s\n", HIDWAY_VERSION); return 0;
         default: usage(argv[0]); return 2;
         }
     }
+    if (wake_mac)
+        return wake_target(wake_mac, wake_to);
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "bad port: %d\n", port);
         return 2;
