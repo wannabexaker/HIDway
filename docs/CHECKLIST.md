@@ -293,6 +293,27 @@ nothing ships as an installer before hardening and serious testing.
    - Hardware: soldered board in an enclosure with the 1 kΩ resistors, photos.
    - Final `/security-review`, `/code-review`, `/repo-hygiene`.
 5. **Setup wizard in the client** (rest of item 24).
+5b. **Input sources** (requested 2026-10-26)
+   - Touchpad: the laptop's ELAN Precision Touchpad does not work while
+     armed. Likely cause: Windows synthesises its pointer moves, so Raw Input
+     reports them without a device handle, and the client drops every
+     device-less event as injected (`client/src/main.c`, "never relayed").
+     First confirm with a small diagnostic; then read the touchpad itself as
+     a HID digitizer (usage page 0x0D, usage 0x05, with its own device
+     handle) and turn contacts into motion, clicks and two-finger scrolling.
+     Never by accepting device-less events, which would admit injected input.
+   - Input sources in the HUD: per-source switches for what is captured
+     while armed (keyboards, mice, touchpad; ideally each device by name).
+   - Phone as a controller (for the need behind the declined items below):
+     a HIDway client for Android that sends only what a person touches in
+     its own screen (keyboard, touchpad), phone -> Tailscale -> Pi -> Pico,
+     with Moonlight on the phone for the picture.
+   - Declined (rule 5): relaying input injected by software, i.e. AnyDesk
+     -> laptop -> Pico, or a local loopback that sends a PC's own virtual
+     input back to it through the Pico. Either turns any program's input
+     (scripts, macros, bots) into hardware input on the target, which is
+     exactly the separation anti-cheat systems rely on; the client refuses
+     injected input by design.
 6. Then: MSI (WiX) + `HIDway-Setup.exe` (Inno Setup) → code signing (SignPath
    Foundation, free for open source) → Linux client → macOS client.
 
