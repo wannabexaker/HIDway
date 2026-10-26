@@ -304,7 +304,7 @@ nothing ships as an installer before hardening and serious testing.
      Never by accepting device-less events, which would admit injected input.
    - Input sources in the HUD: per-source switches for what is captured
      while armed (keyboards, mice, touchpad; ideally each device by name).
-   - Phone as a controller (for the need behind the declined items below):
+   - Phone as a controller (future; the user wants it, 2026-10-26):
      a HIDway client for Android that sends only what a person touches in
      its own screen (keyboard, touchpad), phone -> Tailscale -> Pi -> Pico,
      with Moonlight on the phone for the picture.
@@ -313,7 +313,8 @@ nothing ships as an installer before hardening and serious testing.
      input back to it through the Pico. Either turns any program's input
      (scripts, macros, bots) into hardware input on the target, which is
      exactly the separation anti-cheat systems rely on; the client refuses
-     injected input by design.
+     injected input by design. Also not as an "advanced" option behind a
+     warning (asked 2026-10-26): a warning does not change what it does.
 6. Then: MSI (WiX) + `HIDway-Setup.exe` (Inno Setup) → code signing (SignPath
    Foundation, free for open source) → Linux client → macOS client.
 
